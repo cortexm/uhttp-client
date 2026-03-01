@@ -15,7 +15,7 @@ class TestClientAsync(unittest.TestCase):
 
     server = None
     server_thread = None
-    PORT = 9983
+    PORT = 9903
 
     @classmethod
     def setUpClass(cls):

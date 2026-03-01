@@ -16,7 +16,7 @@ class TestClientBasicAuth(unittest.TestCase):
 
     server = None
     server_thread = None
-    PORT = 9981
+    PORT = 9901
 
     @classmethod
     def setUpClass(cls):
@@ -130,7 +130,7 @@ class TestClientDigestAuth(unittest.TestCase):
 
     server = None
     server_thread = None
-    PORT = 9982
+    PORT = 9902
     REALM = 'test-realm'
     NONCE = 'test-nonce-12345'
 

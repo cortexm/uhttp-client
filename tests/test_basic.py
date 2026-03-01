@@ -15,7 +15,7 @@ class TestClientBasicRequests(unittest.TestCase):
     server = None
     server_thread = None
     last_request = None
-    PORT = 9980
+    PORT = 9900
 
     @classmethod
     def setUpClass(cls):

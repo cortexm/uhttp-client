@@ -36,7 +36,7 @@ class TestClientTimeoutErrors(unittest.TestCase):
 
     server = None
     server_thread = None
-    PORT = 9984
+    PORT = 9904
 
     @classmethod
     def setUpClass(cls):
@@ -108,7 +108,7 @@ class TestClientRequestErrors(unittest.TestCase):
 
     server = None
     server_thread = None
-    PORT = 9987
+    PORT = 9907
 
     @classmethod
     def setUpClass(cls):

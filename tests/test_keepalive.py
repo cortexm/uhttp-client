@@ -14,7 +14,7 @@ class TestClientKeepalive(unittest.TestCase):
 
     server = None
     server_thread = None
-    PORT = 9985
+    PORT = 9905
 
     @classmethod
     def setUpClass(cls):

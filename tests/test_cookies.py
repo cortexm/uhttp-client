@@ -14,7 +14,7 @@ class TestClientCookies(unittest.TestCase):
 
     server = None
     server_thread = None
-    PORT = 9986
+    PORT = 9906
 
     @classmethod
     def setUpClass(cls):

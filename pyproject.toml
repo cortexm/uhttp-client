@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "uhttp-client"
 version = "2.2.0"
 description = "Micro HTTP client for Python and MicroPython"
+readme = "README.md"
 authors = [
     {name = "Pavel Revak", email = "pavelrevak@gmail.com"}
 ]

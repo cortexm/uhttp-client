@@ -580,3 +580,19 @@ client = uhttp.client.HttpClient('http://127.0.0.1:8080')
 # Explicit IPv6
 client = uhttp.client.HttpClient('http://[::1]:8080')
 ```
+
+
+## Development
+
+### Running tests
+
+```bash
+../.venv/bin/pip install -e .
+../.venv/bin/python -m unittest discover -v tests/
+```
+
+For running tests from meta-repo, see [uhttp README](https://github.com/pavelrevak/uhttp#testing).
+
+### CI
+
+Tests run automatically on push/PR via GitHub Actions (Ubuntu + Windows, Python 3.10 + 3.14).
