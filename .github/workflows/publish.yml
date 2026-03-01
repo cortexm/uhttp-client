@@ -25,6 +25,9 @@ jobs:
       - name: Install package
         run: pip install .
 
+      - name: Install test dependencies
+        run: pip install uhttp-server
+
       - name: Run unit tests
         run: python -m unittest discover -v tests/
 
