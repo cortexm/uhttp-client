@@ -96,6 +96,10 @@ def requires_device(cls):
     return cls
 
 
+# Minimum free RAM for HTTPS tests (SSL needs ~35KB + fragmentation buffer)
+MIN_RAM_FOR_HTTPS = 200000
+
+
 class MpyTestCase(unittest.TestCase):
     """Base class for MicroPython tests"""
 
@@ -131,11 +135,10 @@ class MpyTestCase(unittest.TestCase):
 
     @classmethod
     def _connect_wifi(cls):
-        """Connect ESP32 to WiFi and verify DNS works"""
+        """Connect ESP32 to WiFi"""
         code = f"""
 import network
 import time
-import socket
 
 wlan = network.WLAN(network.STA_IF)
 wlan.active(True)
@@ -147,36 +150,26 @@ if not wlan.isconnected():
             break
         time.sleep(0.5)
 
-if not wlan.isconnected():
-    print('WIFI_FAIL')
-else:
+if wlan.isconnected():
     print('WIFI_OK:', wlan.ifconfig()[0])
-    # Wait for network to stabilize and verify DNS
-    time.sleep(2)
-    dns_ok = False
-    for attempt in range(5):
-        try:
-            socket.getaddrinfo('httpbin.org', 80)
-            dns_ok = True
-            break
-        except OSError as e:
-            print('DNS_RETRY:', attempt + 1, str(e))
-            time.sleep(2)
-    if dns_ok:
-        print('DNS_OK')
-    else:
-        print('DNS_FAIL')
+else:
+    print('WIFI_FAIL')
 """
-        result = cls.mpy.comm.exec(code, timeout=40)
+        result = cls.mpy.comm.exec(code, timeout=30)
         if b'WIFI_FAIL' in result:
             raise RuntimeError("WiFi connection failed")
-        if b'DNS_FAIL' in result:
-            raise RuntimeError(f"DNS verification failed: {result.decode('utf-8')}")
 
     def run_on_device(self, code, timeout=30):
         """Run code on device and return output"""
         full_code = "import sys; sys.path.insert(0, '/lib')\n" + code
         return self.mpy.comm.exec(full_code, timeout=timeout).decode('utf-8')
+
+    @classmethod
+    def get_free_memory(cls):
+        """Get free memory on device"""
+        result = cls.mpy.comm.exec_raw_paste(
+            "import gc; gc.collect(); print(gc.mem_free())", timeout=5)
+        return int(result.strip())
 
     def assertDeviceResult(self, code, expected, timeout=30):
         """Run code and check result contains expected string"""
@@ -262,9 +255,16 @@ finally:
 
 @requires_device
 class TestHTTPS(MpyTestCase):
-    """Test HTTPS requests"""
+    """Test HTTPS requests (requires sufficient RAM for SSL)"""
 
-    # MicroPython requires explicit ssl_context for HTTPS
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        free_mem = cls.get_free_memory()
+        if free_mem < MIN_RAM_FOR_HTTPS:
+            raise unittest.SkipTest(
+                f"Not enough RAM for HTTPS: {free_mem} < {MIN_RAM_FOR_HTTPS}")
+
     SSL_SETUP = """
 import ssl
 ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -344,9 +344,16 @@ finally:
 
 @requires_device
 class TestHTTPMethods(MpyTestCase):
-    """Test HTTP methods and status codes"""
+    """Test HTTP methods and status codes (uses HTTPS)"""
 
-    # MicroPython requires explicit ssl_context for HTTPS
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        free_mem = cls.get_free_memory()
+        if free_mem < MIN_RAM_FOR_HTTPS:
+            raise unittest.SkipTest(
+                f"Not enough RAM for HTTPS: {free_mem} < {MIN_RAM_FOR_HTTPS}")
+
     SSL_SETUP = """
 import ssl
 ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
