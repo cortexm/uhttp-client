@@ -131,10 +131,11 @@ class MpyTestCase(unittest.TestCase):
 
     @classmethod
     def _connect_wifi(cls):
-        """Connect ESP32 to WiFi"""
+        """Connect ESP32 to WiFi and verify DNS works"""
         code = f"""
 import network
 import time
+import socket
 
 wlan = network.WLAN(network.STA_IF)
 wlan.active(True)
@@ -146,14 +147,31 @@ if not wlan.isconnected():
             break
         time.sleep(0.5)
 
-if wlan.isconnected():
-    print('WIFI_OK:', wlan.ifconfig()[0])
-else:
+if not wlan.isconnected():
     print('WIFI_FAIL')
+else:
+    print('WIFI_OK:', wlan.ifconfig()[0])
+    # Wait for network to stabilize and verify DNS
+    time.sleep(2)
+    dns_ok = False
+    for attempt in range(5):
+        try:
+            socket.getaddrinfo('httpbin.org', 80)
+            dns_ok = True
+            break
+        except OSError as e:
+            print('DNS_RETRY:', attempt + 1, str(e))
+            time.sleep(2)
+    if dns_ok:
+        print('DNS_OK')
+    else:
+        print('DNS_FAIL')
 """
-        result = cls.mpy.comm.exec(code, timeout=20)
+        result = cls.mpy.comm.exec(code, timeout=40)
         if b'WIFI_FAIL' in result:
             raise RuntimeError("WiFi connection failed")
+        if b'DNS_FAIL' in result:
+            raise RuntimeError(f"DNS verification failed: {result.decode('utf-8')}")
 
     def run_on_device(self, code, timeout=30):
         """Run code on device and return output"""
