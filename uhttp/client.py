@@ -37,6 +37,8 @@ USER_AGENT_VALUE = 'uhttp-client/1.0'
 TRANSFER_ENCODING = 'transfer-encoding'
 AUTHORIZATION = 'authorization'
 WWW_AUTHENTICATE = 'www-authenticate'
+EXPECT = 'expect'
+EXPECT_100_CONTINUE = '100-continue'
 
 STATE_IDLE = 0
 STATE_CONNECTING = 1
@@ -44,6 +46,7 @@ STATE_SENDING = 2
 STATE_RECEIVING_HEADERS = 3
 STATE_RECEIVING_BODY = 4
 STATE_COMPLETE = 5
+STATE_WAITING_100_CONTINUE = 6
 
 
 class HttpClientError(Exception):
@@ -406,6 +409,7 @@ class HttpClient:
     @property
     def read_sockets(self):
         if self._socket and self._state in (
+                STATE_WAITING_100_CONTINUE,
                 STATE_RECEIVING_HEADERS, STATE_RECEIVING_BODY):
             return [self._socket]
         return []
@@ -421,7 +425,8 @@ class HttpClient:
         return []
 
     def _build_request(
-            self, method, path, headers=None, data=None, query=None):
+            self, method, path, headers=None, data=None, query=None,
+            expect_continue=False):
         if headers is None:
             headers = {}
 
@@ -446,6 +451,10 @@ class HttpClient:
 
         if encoded_data:
             headers[CONTENT_LENGTH] = len(encoded_data)
+
+        # Add Expect: 100-continue header if requested and there's data to send
+        if expect_continue and encoded_data:
+            headers[EXPECT] = EXPECT_100_CONTINUE
 
         if self._cookies:
             cookie_str = '; '.join(
@@ -473,7 +482,14 @@ class HttpClient:
         lines.append('')
         lines.append('')
 
-        request = '\r\n'.join(lines).encode('ascii')
+        request_headers = '\r\n'.join(lines).encode('ascii')
+
+        # If expect_continue, return headers and body separately
+        if expect_continue and encoded_data:
+            return (request_headers, encoded_data)
+
+        # Otherwise return combined request
+        request = request_headers
         if encoded_data:
             request += encoded_data
 
@@ -616,6 +632,42 @@ class HttpClient:
         if len(self._buffer) >= self._response_content_length:
             self._state = STATE_COMPLETE
 
+    def _process_100_continue(self):
+        """Process response while waiting for 100 Continue"""
+        self._recv_to_buffer(MAX_RESPONSE_HEADERS_LENGTH)
+
+        for delimiter in HEADERS_DELIMITERS:
+            if delimiter in self._buffer:
+                end_index = self._buffer.index(delimiter) + len(delimiter)
+                header_lines = self._buffer[:end_index].splitlines()
+                self._buffer = self._buffer[end_index:]
+                self._parse_headers(header_lines)
+
+                if self._response_status == 100:
+                    # Got 100 Continue - send body, reset response state
+                    self._response_status = None
+                    self._response_status_message = None
+                    self._response_headers = None
+                    self._response_content_length = None
+                    self._send_buffer.extend(self._pending_body)
+                    self._pending_body = None
+                    self._state = STATE_SENDING
+                    self._try_send()
+                    return
+
+                # Not 100 Continue - this is final response, don't send body
+                self._pending_body = None
+                if self._response_content_length > self._max_response_length:
+                    raise HttpResponseError(
+                        f"Response too large: {self._response_content_length}")
+                self._state = STATE_RECEIVING_BODY
+                if len(self._buffer) >= self._response_content_length:
+                    self._state = STATE_COMPLETE
+                return
+
+        if len(self._buffer) >= MAX_RESPONSE_HEADERS_LENGTH:
+            raise HttpResponseError("Response headers too large")
+
     def _process_recv_headers(self):
         self._recv_to_buffer(MAX_RESPONSE_HEADERS_LENGTH)
 
@@ -660,12 +712,14 @@ class HttpClient:
             self._request_auth = None
             self._request_timeout = None
             self._request_start_time = None
+            self._request_expect_continue = False
         self._response_status = None
         self._response_status_message = None
         self._response_headers = None
         self._response_content_length = None
         self._buffer = bytearray()
         self._send_buffer = bytearray()
+        self._pending_body = None
 
     def _should_keep_alive(self):
         if not self._response_headers:
@@ -691,7 +745,11 @@ class HttpClient:
                 raise HttpConnectionError(f"Send failed: {err}") from err
 
         if not self._send_buffer:
-            self._state = STATE_RECEIVING_HEADERS
+            if self._pending_body is not None:
+                # Waiting for 100 Continue before sending body
+                self._state = STATE_WAITING_100_CONTINUE
+            else:
+                self._state = STATE_RECEIVING_HEADERS
 
     def close(self):
         """Close connection"""
@@ -731,7 +789,9 @@ class HttpClient:
                 self._try_send()
 
             if self._socket in read_sockets:
-                if self._state == STATE_RECEIVING_HEADERS:
+                if self._state == STATE_WAITING_100_CONTINUE:
+                    self._process_100_continue()
+                elif self._state == STATE_RECEIVING_HEADERS:
                     self._process_recv_headers()
                 elif self._state == STATE_RECEIVING_BODY:
                     self._process_recv_body()
@@ -762,11 +822,13 @@ class HttpClient:
     def request(
             self, method, path,
             headers=None, data=None, query=None, json=None, auth=None,
-            timeout=None):
+            timeout=None, expect_continue=False):
         """Start HTTP request (async), returns self for chaining
 
         auth parameter overrides client's default auth for this request.
         timeout parameter overrides client's default timeout for this request.
+        expect_continue sends Expect: 100-continue header and waits for
+        server confirmation before sending body (saves bandwidth on rejection).
         """
         if json is not None:
             data = json
@@ -783,6 +845,7 @@ class HttpClient:
         self._request_auth = auth  # None means use client's default
         self._request_timeout = timeout  # None means use client's default
         self._request_start_time = _time.time()
+        self._request_expect_continue = expect_continue
 
         self._start_request()
 
@@ -797,10 +860,19 @@ class HttpClient:
         headers_copy = dict(self._request_headers) if self._request_headers else {}
         request_data = self._build_request(
             self._request_method, self._request_path,
-            headers_copy, self._request_data, self._request_query)
-        self._send_buffer.extend(request_data)
-        self._state = STATE_SENDING
+            headers_copy, self._request_data, self._request_query,
+            expect_continue=self._request_expect_continue)
 
+        # If expect_continue, request_data is (headers, body) tuple
+        if isinstance(request_data, tuple):
+            headers, body = request_data
+            self._send_buffer.extend(headers)
+            self._pending_body = body
+        else:
+            self._send_buffer.extend(request_data)
+            self._pending_body = None
+
+        self._state = STATE_SENDING
         self._try_send()
 
     def wait(self, timeout=None):

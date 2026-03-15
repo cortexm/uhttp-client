@@ -111,15 +111,19 @@ class MpyTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import mpytool
+        from mpytool.mpy_cross import MpyCross
         from pathlib import Path
 
         cls.conn = mpytool.ConnSerial(port=PORT, baudrate=115200)
         cls.mpy = mpytool.Mpy(cls.conn)
         cls.mpy.stop()
 
-        # Mount uhttp client module
+        # Mount uhttp client module with mpy-cross compilation
         client_dir = Path(__file__).parent.parent / 'uhttp'
-        cls.mount_handler = cls.mpy.mount(str(client_dir), mount_point='/lib/uhttp')
+        mpy_cross = MpyCross()
+        mpy_cross.init(cls.mpy.platform())
+        cls.mount_handler = cls.mpy.mount(
+            str(client_dir), mount_point='/lib/uhttp', mpy_cross=mpy_cross)
 
         # Connect WiFi once
         if not cls.wifi_connected:

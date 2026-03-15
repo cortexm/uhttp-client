@@ -303,7 +303,7 @@ Parameters:
 
 #### Methods
 
-**`request(method, path, headers=None, data=None, query=None, json=None, auth=None, timeout=None)`**
+**`request(method, path, headers=None, data=None, query=None, json=None, auth=None, timeout=None, expect_continue=False)`**
 
 Start HTTP request (async). Returns `self` for chaining.
 
@@ -315,6 +315,7 @@ Start HTTP request (async). Returns `self` for chaining.
 - `json` - Shortcut for data with JSON encoding
 - `auth` - Optional (username, password) tuple, overrides client's default auth
 - `timeout` - Optional timeout in seconds, overrides client's default timeout
+- `expect_continue` - Send `Expect: 100-continue` header and wait for server confirmation before sending body (default: False)
 
 **`get(path, **kwargs)`** - Send GET request
 
@@ -412,6 +413,34 @@ Supported digest features:
 - MD5 and MD5-sess algorithms
 - qop (quality of protection) with auth mode
 - Nonce counting for multiple requests
+
+
+## Expect: 100-continue
+
+For large uploads, use `expect_continue=True` to wait for server confirmation before sending the body. This saves bandwidth when the server rejects the request (e.g., 413 Too Large, 401 Unauthorized):
+
+```python
+import uhttp.client
+
+client = uhttp.client.HttpClient('https://api.example.com')
+
+# Large file upload with expect_continue
+large_data = b'x' * 10_000_000  # 10 MB
+response = client.post('/upload', data=large_data, expect_continue=True).wait()
+
+if response.status == 413:
+    print("Server rejected - body was NOT sent (bandwidth saved)")
+else:
+    print(f"Upload complete: {response.status}")
+
+client.close()
+```
+
+How it works:
+1. Client sends headers with `Expect: 100-continue`
+2. Waits for server response
+3. If server sends `100 Continue` → sends body → waits for final response
+4. If server sends other status (413, 401, etc.) → returns that response (body not sent)
 
 
 ## Cookies
