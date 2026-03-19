@@ -887,13 +887,11 @@ class HttpClient:
     def wait(self, timeout=None):
         """Wait for response (blocking).
 
-        Returns HttpResponse when complete, None if timeout expires.
-        Connection stays open on timeout - wait() can be called again.
+        Returns HttpResponse when complete.
+        Raises HttpTimeoutError if timeout expires.
 
         timeout is the max time to spend in this wait() call.
         If None, uses request timeout or client default.
-        Request timeout (set via request() or client default) is checked
-        separately by process_events() and raises HttpTimeoutError.
         """
         if self._state == STATE_IDLE:
             raise HttpClientError("No request in progress")
@@ -909,7 +907,8 @@ class HttpClient:
                 elapsed = _time.time() - start_time
                 remaining = timeout - elapsed
                 if remaining <= 0:
-                    return None  # wait timeout, can call again
+                    self._close()
+                    raise HttpTimeoutError("Request timed out")
             else:
                 remaining = None
 
@@ -924,11 +923,14 @@ class HttpClient:
             # Always call process_events to check request timeout
             response = self.process_events(r, w)
 
-            if not r and not w:
-                return None  # wait timeout
             if response is not None:
                 return response
 
-            # Check if we're done (state changed to IDLE after digest retry failure)
+            # select() timed out (not SSL pending poll)
+            if not r and not w and select_timeout != 0:
+                self._close()
+                raise HttpTimeoutError("Request timed out")
+
+            # Digest retry failure - state changed to IDLE
             if self._state == STATE_IDLE:
-                return None
+                raise HttpResponseError("Request failed")
