@@ -533,6 +533,10 @@ class HttpClient:
                 # Connect completed immediately (e.g. loopback)
                 self._socket = sock
                 self._connect_complete()
+            except BlockingIOError:
+                # EINPROGRESS on Unix, WSAEWOULDBLOCK on Windows
+                self._socket = sock
+                self._state = STATE_CONNECTING
             except OSError as err:
                 if err.errno == errno.EINPROGRESS:
                     self._socket = sock
