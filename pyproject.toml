@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "uhttp-client"
-version = "2.2.1"
+dynamic = ["version"]
 description = "Micro HTTP client for Python and MicroPython"
 readme = "README.md"
 authors = [
@@ -25,6 +25,9 @@ Repository = "https://github.com/pavelrevak/uhttp-client"
 
 [project.scripts]
 uhttp = "uhttp.cli:main"
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
 
 [tool.setuptools.packages.find]
 include = ["uhttp*"]
