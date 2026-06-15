@@ -11,6 +11,10 @@
 - Base path support for API versioning
 - JSON support (auto-encode request, lazy decode response)
 - Binary data support
+- Chunked transfer encoding (and `Content-Length`) response decoding
+- Streaming event mode (`event_mode=True`) mirroring uhttp-server: `EVENT_*` +
+  `accept_body*()` — stream to memory, file, or NDJSON records
+- Read-until-close responses (`stream=True`) for MJPEG / SSE
 - Cookies persistence
 - HTTP Basic and Digest authentication
 - SSL/TLS support for HTTPS
@@ -321,6 +325,112 @@ for c in clients:
 ```
 
 
+## Streaming & Event Mode
+
+For large or open-ended responses (downloads, NDJSON, MJPEG, SSE) the client
+offers an **event mode** that mirrors uhttp-server's `HttpConnection` API.
+With `event_mode=True`, `wait()` / `process_events()` return `EVENT_*`
+constants instead of an `HttpResponse`, and you choose how the body is
+delivered after the headers arrive.
+
+### Events
+
+| Event | Meaning |
+|---|---|
+| `EVENT_RESPONSE` | Complete response (headers + body) in one step — small/buffered |
+| `EVENT_HEADERS` | Headers ready → call an `accept_body*()` variant |
+| `EVENT_DATA` | One decoded chunk/record ready → `read_buffer()` / `read_record()` |
+| `EVENT_COMPLETE` | Body fully received |
+| `EVENT_ERROR` | Connection or decode error → message in `client.error` (no exception) |
+
+Names and numeric values match uhttp-server, so the same select loop can drive
+both a server and a client.
+
+### Body delivery (choose after `EVENT_HEADERS`)
+
+- `accept_body()` — buffer the whole body → `EVENT_COMPLETE`; read it as a full
+  `HttpResponse` via `client.response` (so `.json()` / `.data` are reused)
+- `accept_body_streaming()` — `EVENT_DATA` per chunk; `read_buffer()` → bytes
+- `accept_body_to_file(path)` — stream the body to disk (low RAM, no `EVENT_DATA`)
+- `accept_ndjson()` — `EVENT_DATA` per record; `read_record()` → decoded object
+
+The *event* tells you the phase; the *decoder* (which `accept_*()` you call)
+tells you the shape of what you read — so new formats add an `accept_*()`, not a
+new event type.
+
+### NDJSON streaming
+
+```python
+import select
+from uhttp.client import (
+    HttpClient, EVENT_HEADERS, EVENT_DATA, EVENT_COMPLETE, EVENT_ERROR)
+
+client = HttpClient('http://api.example.com', event_mode=True)
+client.get('/events.ndjson', stream=True)   # stream until close if unframed
+
+while True:
+    r, w, _ = select.select(client.read_sockets, client.write_sockets, [], 30)
+    event = client.process_events(r, w)
+
+    if event == EVENT_HEADERS:
+        client.accept_ndjson()
+    elif event == EVENT_DATA:
+        record = client.read_record()        # already a decoded object
+        handle(record)
+    elif event == EVENT_COMPLETE:
+        break
+    elif event == EVENT_ERROR:
+        print(client.error)
+        break
+
+client.close()
+```
+
+A line that fails to JSON-decode is reported as `EVENT_ERROR` (with the message
+in `client.error`) only **after** the good records before it have been
+delivered. The client never closes the connection on its own — you decide.
+
+### Download to file (low RAM)
+
+```python
+client = HttpClient('http://example.com', event_mode=True)
+client.get('/firmware.bin')
+
+while True:
+    r, w, _ = select.select(client.read_sockets, client.write_sockets, [], 10)
+    event = client.process_events(r, w)
+    if event == EVENT_HEADERS:
+        client.accept_body_to_file('/sd/firmware.bin')
+    elif event == EVENT_COMPLETE:
+        print('written', client.bytes_received, 'bytes')
+        break
+    elif event == EVENT_ERROR:
+        print(client.error)
+        break
+
+client.close()
+```
+
+### Read until close (MJPEG / SSE)
+
+`stream=True` selects a close-delimited body reader when the response has
+neither `Content-Length` nor chunked encoding — the body is read until the
+server closes the connection. (Such a connection cannot be kept alive.)
+
+```python
+client = HttpClient('http://cam.local', event_mode=True)
+client.get('/stream.mjpeg', stream=True)
+# ... EVENT_HEADERS → accept_body_streaming() → EVENT_DATA loop ...
+```
+
+### Blocking mode still works
+
+Small responses don't need any of this — in event mode they arrive as a single
+`EVENT_RESPONSE` with the full body in `client.response`. And with the default
+`event_mode=False`, `wait()` returns an `HttpResponse` exactly as before;
+chunked decoding works transparently there too.
+
+
 ## API
 
 ### Function `parse_url`
@@ -348,7 +458,7 @@ uhttp.client.parse_url('example.com')
 
 ### Class `HttpClient`
 
-**`uhttp.client.HttpClient(url_or_host, port=None, ssl_context=None, auth=None, connect_timeout=10, timeout=30, max_response_length=1MB)`**
+**`uhttp.client.HttpClient(url_or_host, port=None, ssl_context=None, auth=None, connect_timeout=10, timeout=30, max_response_length=1MB, event_mode=False)`**
 
 Can be initialized with URL or host/port:
 
@@ -372,7 +482,9 @@ Parameters:
 - `auth` - Optional (username, password) tuple for HTTP authentication
 - `connect_timeout` - Connection timeout in seconds (default: 10)
 - `timeout` - Response timeout in seconds (default: 30)
-- `max_response_length` - Maximum response size (default: 1MB)
+- `max_response_length` - Maximum buffered body size (default: 1MB)
+- `event_mode` - If `True`, `wait()`/`process_events()` return `EVENT_*`
+  constants instead of `HttpResponse` (see [Streaming & Event Mode](#streaming--event-mode))
 
 #### Properties
 
@@ -386,9 +498,21 @@ Parameters:
 - `read_sockets` - Sockets to monitor for reading (for select)
 - `write_sockets` - Sockets to monitor for writing (for select)
 
+Event-mode properties (available once headers are received):
+
+- `event` - Last `EVENT_*` constant returned
+- `error` - Error message when the last event was `EVENT_ERROR`
+- `status` - Response status code (int)
+- `status_message` - Response status message (str)
+- `headers` - Response headers dict (keys lowercase)
+- `content_type` - Response Content-Type
+- `content_length` - Response Content-Length, or `None` if unknown
+- `bytes_received` - Decoded body bytes received so far
+- `response` - Completed `HttpResponse` (after `EVENT_RESPONSE` or buffered `EVENT_COMPLETE`)
+
 #### Methods
 
-**`request(method, path, headers=None, data=None, query=None, json=None, auth=None, timeout=None, expect_continue=False)`**
+**`request(method, path, headers=None, data=None, query=None, json=None, auth=None, timeout=None, expect_continue=False, stream=False)`**
 
 Start HTTP request (async). Returns `self` for chaining.
 
@@ -401,6 +525,7 @@ Start HTTP request (async). Returns `self` for chaining.
 - `auth` - Optional (username, password) tuple, overrides client's default auth
 - `timeout` - Optional timeout in seconds, overrides client's default timeout
 - `expect_continue` - Send `Expect: 100-continue` header and wait for server confirmation before sending body (default: False)
+- `stream` - Read a response without `Content-Length`/chunked framing until the server closes the connection (MJPEG, SSE); default: False
 
 **`get(path, **kwargs)`** - Send GET request
 
@@ -416,18 +541,45 @@ Start HTTP request (async). Returns `self` for chaining.
 
 **`wait(timeout=None)`**
 
-Wait for response (blocking). Returns `HttpResponse` when complete.
+Wait for response (blocking).
 
+- Classic mode: returns `HttpResponse` when complete; raises `HttpTimeoutError`
+  if the request timeout expires; returns `None` if the wait timeout expires
+  (connection stays open, can call again).
+- Event mode: returns the next `EVENT_*` constant, or `None` when the wait
+  timeout expires with nothing new.
 - `timeout` - Max time to spend in wait() call. If `None`, uses request timeout.
-- Returns `None` if wait timeout expires (connection stays open, can call again).
-- Raises `HttpTimeoutError` if request timeout expires (connection closed).
 
 **`process_events(read_sockets, write_sockets)`**
 
-Process select events. Returns `HttpResponse` when complete, `None` otherwise.
+Process select events from an external select loop.
 
-- First processes any ready data, then checks request timeout.
-- Raises `HttpTimeoutError` if request timeout has expired and no complete response.
+- Classic mode: returns `HttpResponse` when complete (`None` otherwise); raises
+  on errors.
+- Event mode: returns an `EVENT_*` constant (`None` when nothing new yet);
+  connection/decode errors surface as `EVENT_ERROR` with the message in
+  `client.error`.
+
+#### Event-mode body methods
+
+Call one of these after `EVENT_HEADERS` to choose how the body is delivered
+(see [Streaming & Event Mode](#streaming--event-mode)):
+
+**`accept_body()`** - Buffer the whole body, then emit `EVENT_COMPLETE`; read
+via the `response` property.
+
+**`accept_body_streaming()`** - Emit `EVENT_DATA` per decoded chunk; read bytes
+via `read_buffer()`.
+
+**`accept_body_to_file(path)`** - Stream the decoded body to a file, then emit
+`EVENT_COMPLETE`.
+
+**`accept_ndjson()`** - Decode newline-delimited JSON; emit `EVENT_DATA` per
+record; read decoded objects via `read_record()`.
+
+**`read_buffer()`** - Return decoded body bytes buffered so far, or `None`.
+
+**`read_record()`** - Return the next decoded NDJSON record, or `None`.
 
 **`close()`**
 
@@ -664,6 +816,7 @@ See [examples/](../examples/) directory:
 - `client_basic.py` - Basic blocking examples
 - `client_https.py` - HTTPS examples
 - `client_async.py` - Async select loop examples
+- `client_stream.py` - Event-mode streaming (download-to-file, chunks, NDJSON)
 - `client_with_server.py` - Combined server + client examples
 
 Run examples from project root:

@@ -20,6 +20,7 @@ TIMEOUT = 30
 
 MAX_RESPONSE_HEADERS_LENGTH = 4 * KB
 MAX_RESPONSE_LENGTH = 1 * MB
+BODY_CHUNK_SIZE = 4 * KB
 
 HEADERS_DELIMITERS = (b'\r\n\r\n', b'\n\n')
 CONTENT_LENGTH = 'content-length'
@@ -35,6 +36,7 @@ HOST = 'host'
 USER_AGENT = 'user-agent'
 USER_AGENT_VALUE = 'uhttp-client/1.0'
 TRANSFER_ENCODING = 'transfer-encoding'
+CHUNKED = 'chunked'
 AUTHORIZATION = 'authorization'
 WWW_AUTHENTICATE = 'www-authenticate'
 EXPECT = 'expect'
@@ -48,6 +50,15 @@ STATE_RECEIVING_HEADERS = 4
 STATE_RECEIVING_BODY = 5
 STATE_COMPLETE = 6
 STATE_WAITING_100_CONTINUE = 7
+STATE_HEADERS_READY = 8
+
+# Event types returned by wait()/process_events() in event mode.
+# Names and numeric values mirror uhttp-server's HttpConnection events.
+EVENT_RESPONSE = 0   # Complete response (headers + body) in one step
+EVENT_HEADERS = 1    # Headers received, call accept_body*()
+EVENT_DATA = 2       # Decoded body chunk available, call read_buffer()
+EVENT_COMPLETE = 3   # Body fully received
+EVENT_ERROR = 4      # Error occurred (timeout, disconnect, decode error)
 
 
 class HttpClientError(Exception):
@@ -64,6 +75,206 @@ class HttpTimeoutError(HttpClientError):
 
 class HttpResponseError(HttpClientError):
     """Response parsing error"""
+
+
+class _BodyReader:
+    """Body framing strategy for decoding an HTTP response body.
+
+    Subclasses consume raw bytes from the recv buffer (a bytearray, modified
+    in place — the consumed prefix is removed) and return decoded body bytes.
+    ``self.complete`` becomes True once the end of the body has been reached.
+    """
+
+    keep_alive_capable = True
+
+    def __init__(self):
+        self.complete = False
+
+    def wanted(self):
+        """Number of raw bytes to receive next, or None if unbounded."""
+        return None
+
+    def feed(self, buffer):
+        """Consume framing bytes from buffer; return decoded body bytes."""
+        raise NotImplementedError
+
+
+class _LengthBodyReader(_BodyReader):
+    """Read exactly Content-Length bytes from the stream."""
+
+    def __init__(self, length):
+        super().__init__()
+        self._remaining = length
+        if length <= 0:
+            self.complete = True
+
+    def wanted(self):
+        return self._remaining
+
+    def feed(self, buffer):
+        if self._remaining <= 0:
+            self.complete = True
+            return b''
+        take = min(self._remaining, len(buffer))
+        if take == 0:
+            return b''
+        data = bytes(buffer[:take])
+        del buffer[:take]
+        self._remaining -= take
+        if self._remaining <= 0:
+            self.complete = True
+        return data
+
+
+class _ChunkedBodyReader(_BodyReader):
+    """Decode HTTP/1.1 chunked transfer encoding.
+
+    Stateful — keeps partial-chunk state across recv boundaries. Chunk
+    extensions and trailer headers are parsed and discarded.
+    """
+
+    _SIZE = 0     # reading the chunk-size line
+    _DATA = 1     # reading chunk payload
+    _CRLF = 2     # consuming the CRLF after a chunk payload
+    _TRAILER = 3  # reading trailer headers after the terminal chunk
+
+    def __init__(self):
+        super().__init__()
+        self._sub = self._SIZE
+        self._remaining = 0
+
+    def feed(self, buffer):
+        out = bytearray()
+        while True:
+            if self._sub == self._SIZE:
+                idx = buffer.find(b'\n')
+                if idx == -1:
+                    break
+                line = bytes(buffer[:idx]).strip()
+                del buffer[:idx + 1]
+                if b';' in line:
+                    line = line[:line.index(b';')].strip()
+                if not line:
+                    continue
+                try:
+                    size = int(line, 16)
+                except ValueError as err:
+                    raise HttpResponseError(
+                        f"Invalid chunk size: {line!r}") from err
+                if size == 0:
+                    self._sub = self._TRAILER
+                else:
+                    self._remaining = size
+                    self._sub = self._DATA
+            elif self._sub == self._DATA:
+                if not buffer:
+                    break
+                take = min(self._remaining, len(buffer))
+                out.extend(buffer[:take])
+                del buffer[:take]
+                self._remaining -= take
+                if self._remaining == 0:
+                    self._sub = self._CRLF
+            elif self._sub == self._CRLF:
+                if not buffer:
+                    break
+                if buffer[:1] == b'\r':
+                    if len(buffer) < 2:
+                        break
+                    del buffer[:2]
+                elif buffer[:1] == b'\n':
+                    del buffer[:1]
+                self._sub = self._SIZE
+            elif self._sub == self._TRAILER:
+                idx = buffer.find(b'\n')
+                if idx == -1:
+                    break
+                line = bytes(buffer[:idx]).strip()
+                del buffer[:idx + 1]
+                if not line:
+                    self.complete = True
+                    break
+        return bytes(out)
+
+
+class _EofBodyReader(_BodyReader):
+    """Read the body until the server closes the connection.
+
+    Used when neither Content-Length nor chunked encoding is available.
+    Cannot keep the connection alive — the close is the framing.
+    """
+
+    keep_alive_capable = False
+
+    def feed(self, buffer):
+        if not buffer:
+            return b''
+        data = bytes(buffer)
+        del buffer[:]
+        return data
+
+    def feed_eof(self):
+        self.complete = True
+
+
+class _RecordDecoder:
+    """Turns a decoded body byte stream into application-level records.
+
+    Sits above the body reader: bytes -> _BodyReader -> decoded body ->
+    _RecordDecoder -> records. Selected by the accept_*() variant the caller
+    chooses; the event type stays EVENT_DATA regardless of record shape.
+    """
+
+    def feed(self, data):
+        """Consume body bytes; return a list of complete records."""
+        raise NotImplementedError
+
+    def flush(self):
+        """Return any final record buffered at end of stream."""
+        return []
+
+
+class _NdjsonDecoder(_RecordDecoder):
+    """Newline-delimited JSON: one JSON value per line.
+
+    A line that fails to decode does not discard already-parsed records: the
+    good records are returned and the error is remembered (self.error) so the
+    caller can deliver them first and surface the error afterwards.
+    """
+
+    def __init__(self):
+        self._carry = bytearray()
+        self.error = None
+
+    def feed(self, data):
+        records = []
+        if self.error is not None:
+            return records
+        self._carry.extend(data)
+        idx = self._carry.find(b'\n')
+        while idx != -1:
+            line = bytes(self._carry[:idx]).strip()
+            del self._carry[:idx + 1]
+            if line:
+                try:
+                    records.append(_decode_json(line))
+                except HttpResponseError as err:
+                    self.error = err
+                    return records
+            idx = self._carry.find(b'\n')
+        return records
+
+    def flush(self):
+        if self.error is not None:
+            return []
+        line = bytes(self._carry).strip()
+        self._carry = bytearray()
+        if line:
+            try:
+                return [_decode_json(line)]
+            except HttpResponseError as err:
+                self.error = err
+        return []
 
 
 def _parse_header_line(line):
@@ -260,6 +471,18 @@ def _build_digest_auth(username, password, method, uri, auth_params, nc=1):
     return 'Digest ' + ', '.join(parts)
 
 
+def _decode_json(data):
+    """Decode JSON, raising HttpResponseError on failure.
+
+    Shared by HttpResponse.json() and the streaming NDJSON decoder so both
+    use the same parsing and error path.
+    """
+    try:
+        return _json.loads(data)
+    except ValueError as err:
+        raise HttpResponseError(f"JSON decode error: {err}") from err
+
+
 class HttpResponse:
     """HTTP response"""
 
@@ -298,10 +521,7 @@ class HttpResponse:
     def json(self):
         """Parse response body as JSON (lazy, cached)"""
         if self._json is None:
-            try:
-                self._json = _json.loads(self._data)
-            except ValueError as err:
-                raise HttpResponseError(f"JSON decode error: {err}") from err
+            self._json = _decode_json(self._data)
         return self._json
 
     def __repr__(self):
@@ -319,7 +539,7 @@ class HttpClient:
     def __init__(
             self, url_or_host, port=None, ssl_context=None, auth=None,
             connect_timeout=CONNECT_TIMEOUT, timeout=TIMEOUT,
-            max_response_length=MAX_RESPONSE_LENGTH):
+            max_response_length=MAX_RESPONSE_LENGTH, event_mode=False):
         # Parse URL if provided
         if '://' in url_or_host or url_or_host.startswith('http'):
             host, parsed_port, base_path, use_ssl, url_auth = parse_url(
@@ -350,6 +570,7 @@ class HttpClient:
         self._connect_timeout = connect_timeout
         self._timeout = timeout
         self._max_response_length = max_response_length
+        self._event_mode = event_mode
 
         self._socket = None
         self._state = STATE_IDLE
@@ -365,11 +586,24 @@ class HttpClient:
         self._request_auth = None
         self._request_timeout = None
         self._request_start_time = None
+        self._request_stream = False
 
         self._response_status = None
         self._response_status_message = None
         self._response_headers = None
-        self._response_content_length = None
+        self._response = None
+        self._body = bytearray()
+        self._body_reader = None
+
+        # Event-mode state
+        self._event = None
+        self._error = None
+        # None / 'buffer' / 'stream' / 'file' / 'record'
+        self._accept_mode = None
+        self._body_file_handle = None
+        self._bytes_received = 0
+        self._record_decoder = None
+        self._records = []
 
         self._cookies = {}
 
@@ -408,6 +642,56 @@ class HttpClient:
     @property
     def base_path(self):
         return self._base_path
+
+    @property
+    def event(self):
+        """Current event type (event mode only)"""
+        return self._event
+
+    @property
+    def error(self):
+        """Error message when the last event was EVENT_ERROR"""
+        return self._error
+
+    @property
+    def response(self):
+        """Completed HttpResponse (EVENT_RESPONSE / buffered EVENT_COMPLETE)"""
+        return self._response
+
+    @property
+    def status(self):
+        """Response status code (available from EVENT_HEADERS on)"""
+        return self._response_status
+
+    @property
+    def status_message(self):
+        """Response status message (available from EVENT_HEADERS on)"""
+        return self._response_status_message
+
+    @property
+    def headers(self):
+        """Response headers dict (available from EVENT_HEADERS on)"""
+        return self._response_headers
+
+    @property
+    def content_type(self):
+        """Response Content-Type (available from EVENT_HEADERS on)"""
+        if self._response_headers is None:
+            return ''
+        return self._response_headers.get(CONTENT_TYPE, '')
+
+    @property
+    def content_length(self):
+        """Response Content-Length, or None if not present/known"""
+        if self._response_headers is None:
+            return None
+        val = self._response_headers.get(CONTENT_LENGTH)
+        return int(val) if val else None
+
+    @property
+    def bytes_received(self):
+        """Number of decoded body bytes received so far"""
+        return self._bytes_received
 
     @property
     def read_sockets(self):
@@ -514,6 +798,8 @@ class HttpClient:
         self._state = STATE_IDLE
         self._buffer = bytearray()
         self._send_buffer = bytearray()
+        self._body = bytearray()
+        self._body_reader = None
 
     def _connect(self):
         if self._socket is not None:
@@ -662,7 +948,7 @@ class HttpClient:
             self._response_status,
             self._response_status_message,
             self._response_headers,
-            bytes(self._buffer[:self._response_content_length])
+            bytes(self._body)
         )
 
         if not self._should_keep_alive():
@@ -699,8 +985,59 @@ class HttpClient:
                 else:
                     self._response_headers[key] = val
 
+        self._body_reader = self._make_body_reader()
+
+    def _make_body_reader(self):
+        """Select a body framing strategy based on response headers."""
+        te = self._response_headers.get(TRANSFER_ENCODING, '').lower()
+        if CHUNKED in te:
+            return _ChunkedBodyReader()
         cl = self._response_headers.get(CONTENT_LENGTH)
-        self._response_content_length = int(cl) if cl else 0
+        if cl is not None:
+            return _LengthBodyReader(int(cl))
+        if self._request_stream:
+            # Streaming request without framing: read until the server closes
+            # the connection (MJPEG, SSE, close-delimited bodies).
+            return _EofBodyReader()
+        # Neither Content-Length nor chunked: preserve historical behavior
+        # and treat the body as empty.
+        return _LengthBodyReader(0)
+
+    def _check_response_length(self):
+        """Fast-fail when the advertised Content-Length is too large."""
+        cl = self._response_headers.get(CONTENT_LENGTH)
+        if cl is not None and int(cl) > self._max_response_length:
+            raise HttpResponseError(f"Response too large: {cl}")
+
+    def _feed_body(self):
+        """Feed buffered raw bytes through the body reader into self._body."""
+        decoded = self._body_reader.feed(self._buffer)
+        if decoded:
+            self._body.extend(decoded)
+            self._bytes_received += len(decoded)
+        if len(self._body) > self._max_response_length:
+            raise HttpResponseError(f"Response too large: {len(self._body)}")
+        if self._body_reader.complete:
+            self._state = STATE_COMPLETE
+        else:
+            self._state = STATE_RECEIVING_BODY
+
+    def _on_headers_complete(self):
+        """Decide how the body is delivered once headers are parsed.
+
+        Classic mode proceeds straight into the body. Event mode pauses at
+        EVENT_HEADERS for an accept_body*() call, unless the whole body
+        already arrived together with the headers (then EVENT_RESPONSE).
+        """
+        self._check_response_length()
+        self._feed_body()  # decode any body bytes already in the buffer
+        if not self._event_mode:
+            return
+        if self._state == STATE_COMPLETE:
+            self._event = EVENT_RESPONSE
+        else:
+            self._state = STATE_HEADERS_READY
+            self._event = EVENT_HEADERS
 
     def _parse_status_line(self, line):
         try:
@@ -724,19 +1061,18 @@ class HttpClient:
 
         self._response_status_message = parts[2] if len(parts) > 2 else ''
 
-    def _process_recv_body(self):
-        if self._response_content_length == 0:
-            self._state = STATE_COMPLETE
-            return
-
-        self._recv_to_buffer(self._response_content_length)
-
-        if len(self._buffer) >= self._response_content_length:
-            self._state = STATE_COMPLETE
+    def _recv_into_body(self):
+        """Receive and decode body bytes into self._body."""
+        recv_size = self._body_reader.wanted()
+        if recv_size is None:
+            recv_size = BODY_CHUNK_SIZE
+        if recv_size > 0 and not self._body_reader.complete:
+            self._recv_to_buffer(recv_size)
+        self._feed_body()
 
     def _process_100_continue(self):
         """Process response while waiting for 100 Continue"""
-        self._recv_to_buffer(MAX_RESPONSE_HEADERS_LENGTH)
+        self._recv_to_buffer(MAX_RESPONSE_HEADERS_LENGTH - len(self._buffer))
 
         for delimiter in HEADERS_DELIMITERS:
             if delimiter in self._buffer:
@@ -750,7 +1086,7 @@ class HttpClient:
                     self._response_status = None
                     self._response_status_message = None
                     self._response_headers = None
-                    self._response_content_length = None
+                    self._body_reader = None
                     self._send_buffer.extend(self._pending_body)
                     self._pending_body = None
                     self._state = STATE_SENDING
@@ -759,19 +1095,14 @@ class HttpClient:
 
                 # Not 100 Continue - this is final response, don't send body
                 self._pending_body = None
-                if self._response_content_length > self._max_response_length:
-                    raise HttpResponseError(
-                        f"Response too large: {self._response_content_length}")
-                self._state = STATE_RECEIVING_BODY
-                if len(self._buffer) >= self._response_content_length:
-                    self._state = STATE_COMPLETE
+                self._on_headers_complete()
                 return
 
         if len(self._buffer) >= MAX_RESPONSE_HEADERS_LENGTH:
             raise HttpResponseError("Response headers too large")
 
     def _process_recv_headers(self):
-        self._recv_to_buffer(MAX_RESPONSE_HEADERS_LENGTH)
+        self._recv_to_buffer(MAX_RESPONSE_HEADERS_LENGTH - len(self._buffer))
 
         for delimiter in HEADERS_DELIMITERS:
             if delimiter in self._buffer:
@@ -779,12 +1110,7 @@ class HttpClient:
                 header_lines = self._buffer[:end_index].splitlines()
                 self._buffer = self._buffer[end_index:]
                 self._parse_headers(header_lines)
-                if self._response_content_length > self._max_response_length:
-                    raise HttpResponseError(
-                        f"Response too large: {self._response_content_length}")
-                self._state = STATE_RECEIVING_BODY
-                if len(self._buffer) >= self._response_content_length:
-                    self._state = STATE_COMPLETE
+                self._on_headers_complete()
                 return
 
         if len(self._buffer) >= MAX_RESPONSE_HEADERS_LENGTH:
@@ -796,9 +1122,17 @@ class HttpClient:
                 hasattr(self._socket, 'pending') and
                 self._socket.pending() > 0)
 
-    def _recv_to_buffer(self, max_size):
+    def _recv_to_buffer(self, recv_size):
+        """Receive up to recv_size bytes, appending them to self._buffer.
+
+        Returns True if data was received (or EOF was handled), False on
+        EAGAIN / SSL want-read. Raises HttpConnectionError if the peer closes
+        the connection while a framed body is still expected.
+        """
+        if recv_size <= 0:
+            return False
         try:
-            data = self._socket.recv(max_size - len(self._buffer))
+            data = self._socket.recv(recv_size)
         except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
             return False
         except OSError as err:
@@ -806,6 +1140,12 @@ class HttpClient:
                 return False
             raise HttpConnectionError(f"Recv failed: {err}") from err
         if not data:
+            # Peer closed the connection. For close-delimited bodies this is
+            # the end of the body, not an error.
+            if (self._body_reader is not None
+                    and not self._body_reader.keep_alive_capable):
+                self._body_reader.feed_eof()
+                return True
             raise HttpConnectionError("Connection closed by server")
         self._buffer.extend(data)
         return True
@@ -821,16 +1161,30 @@ class HttpClient:
             self._request_timeout = None
             self._request_start_time = None
             self._request_expect_continue = False
+            self._request_stream = False
         self._response_status = None
         self._response_status_message = None
         self._response_headers = None
-        self._response_content_length = None
+        self._response = None
+        self._body = bytearray()
+        self._body_reader = None
         self._buffer = bytearray()
         self._send_buffer = bytearray()
         self._pending_body = None
+        self._event = None
+        self._error = None
+        self._accept_mode = None
+        self._bytes_received = 0
+        self._record_decoder = None
+        self._records = []
+        self._close_body_file()
 
     def _should_keep_alive(self):
         if not self._response_headers:
+            return False
+        # Close-delimited bodies (EOF reader) cannot keep the connection alive.
+        if (self._body_reader is not None
+                and not self._body_reader.keep_alive_capable):
             return False
         conn = self._response_headers.get(CONNECTION, '').lower()
         if conn == CONNECTION_CLOSE:
@@ -884,10 +1238,20 @@ class HttpClient:
         return self.request('POST', path, **kwargs)
 
     def process_events(self, read_sockets, write_sockets):
-        """Process select events, returns HttpResponse when complete
+        """Process select events from an external select loop.
 
-        Raises HttpTimeoutError if request timeout has expired and no data ready.
+        Classic mode: returns HttpResponse when the response is complete
+        (or None), and raises on errors.
+
+        Event mode: returns an EVENT_* constant (or None when there is
+        nothing new yet); connection errors surface as EVENT_ERROR with the
+        message in client.error.
         """
+        if self._event_mode:
+            return self._process_events_eventmode(read_sockets, write_sockets)
+        return self._process_events_classic(read_sockets, write_sockets)
+
+    def _process_events_classic(self, read_sockets, write_sockets):
         if self._state == STATE_IDLE:
             return None
 
@@ -922,7 +1286,7 @@ class HttpClient:
                 elif self._state == STATE_RECEIVING_HEADERS:
                     self._process_recv_headers()
                 elif self._state == STATE_RECEIVING_BODY:
-                    self._process_recv_body()
+                    self._recv_into_body()
 
             if self._state == STATE_COMPLETE:
                 response = self._finalize_response()
@@ -943,6 +1307,234 @@ class HttpClient:
 
         return None
 
+    def _process_events_eventmode(self, read_sockets, write_sockets):
+        self._event = None
+        # IDLE: nothing in progress. HEADERS_READY: waiting for accept_body().
+        if self._state in (STATE_IDLE, STATE_HEADERS_READY):
+            return None
+
+        try:
+            # Non-blocking connect completion
+            if self._state == STATE_CONNECTING:
+                if self._socket in write_sockets:
+                    self._process_connecting()
+                if self._state == STATE_CONNECTING:
+                    self._check_connect_timeout()
+                    return None
+
+            # Non-blocking SSL handshake
+            if self._state == STATE_SSL_HANDSHAKE:
+                if (self._socket in read_sockets
+                        or self._socket in write_sockets):
+                    self._process_ssl_handshake()
+                if self._state == STATE_SSL_HANDSHAKE:
+                    self._check_connect_timeout()
+                    return None
+
+            # Send request data
+            if self._socket in write_sockets and self._state == STATE_SENDING:
+                self._try_send()
+
+            readable = (self._socket in read_sockets
+                        or self._has_ssl_pending()
+                        or self._has_pending_body())
+            if readable:
+                if self._state == STATE_WAITING_100_CONTINUE:
+                    self._process_100_continue()
+                elif self._state == STATE_RECEIVING_HEADERS:
+                    self._process_recv_headers()
+                elif self._state == STATE_RECEIVING_BODY:
+                    self._process_body_streaming()
+
+            if self._state == STATE_COMPLETE:
+                if self._event == EVENT_DATA:
+                    pass  # deliver buffered data/records before EVENT_COMPLETE
+                elif self._accept_mode == 'stream' and self._body:
+                    self._event = EVENT_DATA
+                elif self._accept_mode == 'record' and self._records:
+                    self._event = EVENT_DATA
+                else:
+                    self._complete_event()
+
+        except (HttpConnectionError, HttpTimeoutError,
+                HttpResponseError) as err:
+            self._error = str(err)
+            self._close()
+            self._event = EVENT_ERROR
+            return self._event
+
+        # Overall request timeout applies only to pre-body phases; a live
+        # stream may run indefinitely and is bounded by the caller's select
+        # timeout instead.
+        if (self._event is None
+                and self._request_start_time is not None
+                and self._state in (
+                    STATE_SENDING, STATE_RECEIVING_HEADERS,
+                    STATE_WAITING_100_CONTINUE)):
+            timeout = (self._request_timeout
+                       if self._request_timeout is not None
+                       else self._timeout)
+            if timeout and _time.time() - self._request_start_time > timeout:
+                self._error = "Request timed out"
+                self._close()
+                self._event = EVENT_ERROR
+
+        return self._event
+
+    def _process_body_streaming(self):
+        """Event-mode body step: recv, decode, emit EVENT_DATA / write file."""
+        self._recv_into_body()
+        if self._accept_mode == 'file':
+            if self._body:
+                self._flush_body_file()
+        elif self._accept_mode == 'stream':
+            if self._body:
+                self._event = EVENT_DATA
+        elif self._accept_mode == 'record':
+            if self._body:
+                data = bytes(self._body)
+                self._body = bytearray()
+                self._records.extend(self._record_decoder.feed(data))
+            if self._state == STATE_COMPLETE:
+                # Flush the trailing line (no newline) once the stream ends.
+                self._records.extend(self._record_decoder.flush())
+            if self._records:
+                self._event = EVENT_DATA
+            elif self._record_decoder.error is not None:
+                # All good records consumed; surface the decode error now.
+                raise HttpResponseError(str(self._record_decoder.error))
+        # 'buffer' mode accumulates silently until STATE_COMPLETE
+
+    def _complete_event(self):
+        """Finalize a completed response in event mode."""
+        if self._accept_mode == 'file':
+            self._close_body_file()
+        if self._accept_mode in (None, 'buffer'):
+            self._response = HttpResponse(
+                self._response_status,
+                self._response_status_message,
+                self._response_headers,
+                bytes(self._body))
+        # EVENT_RESPONSE (body arrived with headers) takes precedence.
+        if self._event != EVENT_RESPONSE:
+            self._event = EVENT_COMPLETE
+        self._finish_keepalive()
+
+    def _finish_keepalive(self):
+        """Keep-alive vs close after a completed response (event mode).
+
+        Response metadata (status/headers/response) is preserved for the
+        caller; it is cleared on the next request().
+        """
+        if self._should_keep_alive():
+            self._buffer = bytearray()
+            self._body = bytearray()
+            self._body_reader = None
+            self._state = STATE_IDLE
+        else:
+            self._close()  # drops the socket, keeps response metadata
+
+    def _has_pending_body(self):
+        """True when buffered body data can progress without a socket read."""
+        if self._state == STATE_COMPLETE:
+            return True
+        if self._state != STATE_RECEIVING_BODY:
+            return False
+        if self._buffer:
+            return True
+        if self._body_reader is not None and self._body_reader.complete:
+            return True
+        if self._accept_mode in ('stream', 'file') and self._body:
+            return True
+        if self._accept_mode == 'record' and (
+                self._body or self._records
+                or (self._record_decoder is not None
+                    and self._record_decoder.error is not None)):
+            return True
+        return False
+
+    def accept_body(self):
+        """Buffer the whole body, then emit EVENT_COMPLETE.
+
+        Read the result via the .response property. Valid only after
+        EVENT_HEADERS.
+        """
+        self._accept_common()
+        self._accept_mode = 'buffer'
+
+    def accept_body_streaming(self):
+        """Emit EVENT_DATA for each decoded chunk; read via read_buffer().
+
+        Valid only after EVENT_HEADERS.
+        """
+        self._accept_common()
+        self._accept_mode = 'stream'
+
+    def accept_ndjson(self):
+        """Decode newline-delimited JSON, one record per EVENT_DATA.
+
+        Read each record via read_record(). A line that fails to decode
+        surfaces as EVENT_ERROR (the caller decides whether to close).
+        Valid only after EVENT_HEADERS.
+        """
+        self._accept_common()
+        self._accept_mode = 'record'
+        self._record_decoder = _NdjsonDecoder()
+
+    def accept_body_to_file(self, path):
+        """Write the decoded body to a file, then emit EVENT_COMPLETE.
+
+        Valid only after EVENT_HEADERS.
+        """
+        self._accept_common()
+        self._accept_mode = 'file'
+        try:
+            self._body_file_handle = open(path, 'wb')
+        except OSError as err:
+            self._close()
+            raise HttpClientError(
+                f"Cannot open file {path}: {err}") from err
+
+    def _accept_common(self):
+        if self._state != STATE_HEADERS_READY:
+            raise HttpClientError(
+                "accept_body() can only be called after EVENT_HEADERS")
+        self._state = STATE_RECEIVING_BODY
+
+    def read_buffer(self):
+        """Return decoded body bytes buffered so far, or None if empty."""
+        if not self._body:
+            return None
+        data = bytes(self._body)
+        self._body = bytearray()
+        return data
+
+    def read_record(self):
+        """Return the next decoded record (accept_ndjson), or None if none.
+
+        One record is delivered per EVENT_DATA, so the typical handler is
+        simply ``handle(client.read_record())``.
+        """
+        if not self._records:
+            return None
+        return self._records.pop(0)
+
+    def _flush_body_file(self):
+        try:
+            self._body_file_handle.write(self._body)
+        except OSError as err:
+            self._close_body_file()
+            raise HttpConnectionError(f"Failed to write file: {err}") from err
+        self._body = bytearray()
+
+    def _close_body_file(self):
+        if self._body_file_handle is not None:
+            try:
+                self._body_file_handle.close()
+            except OSError:
+                pass
+            self._body_file_handle = None
+
     def put(self, path, **kwargs):
         """Send PUT request"""
         return self.request('PUT', path, **kwargs)
@@ -950,13 +1542,15 @@ class HttpClient:
     def request(
             self, method, path,
             headers=None, data=None, query=None, json=None, auth=None,
-            timeout=None, expect_continue=False):
+            timeout=None, expect_continue=False, stream=False):
         """Start HTTP request (async), returns self for chaining
 
         auth parameter overrides client's default auth for this request.
         timeout parameter overrides client's default timeout for this request.
         expect_continue sends Expect: 100-continue header and waits for
         server confirmation before sending body (saves bandwidth on rejection).
+        stream=True reads a response without Content-Length/chunked framing
+        until the server closes the connection (MJPEG, SSE, etc.).
         """
         if json is not None:
             data = json
@@ -982,6 +1576,7 @@ class HttpClient:
         self._request_timeout = timeout  # None means use client's default
         self._request_start_time = _time.time()
         self._request_expect_continue = expect_continue
+        self._request_stream = stream
 
         self._start_request()
 
@@ -1000,12 +1595,15 @@ class HttpClient:
     def wait(self, timeout=None):
         """Wait for response (blocking).
 
-        Returns HttpResponse when complete.
-        Raises HttpTimeoutError if timeout expires.
+        Classic mode: returns HttpResponse when complete, raises on timeout.
+        Event mode: returns the next EVENT_* constant, or None on timeout.
 
         timeout is the max time to spend in this wait() call.
         If None, uses request timeout or client default.
         """
+        if self._event_mode:
+            return self._wait_event(timeout)
+
         if self._state == STATE_IDLE:
             raise HttpClientError("No request in progress")
 
@@ -1050,3 +1648,41 @@ class HttpClient:
             # Digest retry failure - state changed to IDLE
             if self._state == STATE_IDLE:
                 raise HttpResponseError("Request failed")
+
+    def _wait_event(self, timeout):
+        """Wait for the next event (event mode).
+
+        Returns an EVENT_* constant, or None when the select() timeout
+        expires with nothing new (the caller loops and calls wait() again).
+        """
+        # IDLE: no request. HEADERS_READY: caller must call accept_body*().
+        if self._state in (STATE_IDLE, STATE_HEADERS_READY):
+            return None
+
+        if timeout is None:
+            timeout = (self._request_timeout
+                       if self._request_timeout is not None
+                       else self._timeout)
+
+        # SSL or already-buffered body data is invisible to select() - poll.
+        if self._has_ssl_pending() or self._has_pending_body():
+            select_timeout = 0
+        else:
+            select_timeout = timeout
+
+        try:
+            r, w, x = _select.select(
+                self.read_sockets,
+                self.write_sockets,
+                self.write_sockets, select_timeout)
+        except (OSError, ValueError) as err:
+            self._error = f"select failed: {err}"
+            self._close()
+            self._event = EVENT_ERROR
+            return EVENT_ERROR
+
+        # Windows signals connect errors via the except set
+        if x:
+            w = list(set(w) | set(x))
+
+        return self.process_events(r, w)

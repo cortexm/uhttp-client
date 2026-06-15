@@ -536,5 +536,133 @@ class TestHttpClientErrors(unittest.TestCase):
         client.close()
 
 
+class TestLengthBodyReader(unittest.TestCase):
+    """Tests for _LengthBodyReader"""
+
+    def test_exact_length(self):
+        reader = uhttp_client._LengthBodyReader(5)
+        buf = bytearray(b'hello')
+        data = reader.feed(buf)
+        self.assertEqual(data, b'hello')
+        self.assertTrue(reader.complete)
+        self.assertEqual(len(buf), 0)
+
+    def test_split_across_feeds(self):
+        reader = uhttp_client._LengthBodyReader(5)
+        buf = bytearray(b'he')
+        self.assertEqual(reader.feed(buf), b'he')
+        self.assertFalse(reader.complete)
+        buf.extend(b'llo')
+        self.assertEqual(reader.feed(buf), b'llo')
+        self.assertTrue(reader.complete)
+
+    def test_does_not_overread(self):
+        """Extra bytes beyond Content-Length stay in the buffer"""
+        reader = uhttp_client._LengthBodyReader(5)
+        buf = bytearray(b'helloEXTRA')
+        self.assertEqual(reader.feed(buf), b'hello')
+        self.assertTrue(reader.complete)
+        self.assertEqual(bytes(buf), b'EXTRA')
+
+    def test_zero_length(self):
+        reader = uhttp_client._LengthBodyReader(0)
+        self.assertTrue(reader.complete)
+        self.assertEqual(reader.feed(bytearray()), b'')
+
+    def test_wanted_tracks_remaining(self):
+        reader = uhttp_client._LengthBodyReader(10)
+        self.assertEqual(reader.wanted(), 10)
+        reader.feed(bytearray(b'abc'))
+        self.assertEqual(reader.wanted(), 7)
+
+
+class TestChunkedBodyReader(unittest.TestCase):
+    """Tests for _ChunkedBodyReader"""
+
+    def test_single_chunk(self):
+        reader = uhttp_client._ChunkedBodyReader()
+        buf = bytearray(b'5\r\nhello\r\n0\r\n\r\n')
+        data = reader.feed(buf)
+        self.assertEqual(data, b'hello')
+        self.assertTrue(reader.complete)
+        self.assertEqual(len(buf), 0)
+
+    def test_multiple_chunks(self):
+        reader = uhttp_client._ChunkedBodyReader()
+        buf = bytearray(b'5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n')
+        data = reader.feed(buf)
+        self.assertEqual(data, b'hello world')
+        self.assertTrue(reader.complete)
+
+    def test_split_across_feeds(self):
+        # Feed incrementally on a shared buffer, splitting at awkward points
+        reader = uhttp_client._ChunkedBodyReader()
+        buf = bytearray()
+        result = bytearray()
+        for piece in (b'5\r', b'\nhel', b'lo\r\n0', b'\r\n\r\n'):
+            buf.extend(piece)
+            result.extend(reader.feed(buf))
+        self.assertEqual(bytes(result), b'hello')
+        self.assertTrue(reader.complete)
+
+    def test_chunk_extensions_ignored(self):
+        reader = uhttp_client._ChunkedBodyReader()
+        buf = bytearray(b'5;name=value\r\nhello\r\n0\r\n\r\n')
+        self.assertEqual(reader.feed(buf), b'hello')
+        self.assertTrue(reader.complete)
+
+    def test_trailer_headers_ignored(self):
+        reader = uhttp_client._ChunkedBodyReader()
+        buf = bytearray(b'5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n')
+        self.assertEqual(reader.feed(buf), b'hello')
+        self.assertTrue(reader.complete)
+
+    def test_incomplete_not_complete(self):
+        reader = uhttp_client._ChunkedBodyReader()
+        buf = bytearray(b'5\r\nhel')
+        self.assertEqual(reader.feed(buf), b'hel')
+        self.assertFalse(reader.complete)
+
+    def test_invalid_chunk_size_raises(self):
+        reader = uhttp_client._ChunkedBodyReader()
+        buf = bytearray(b'zz\r\nhello\r\n')
+        with self.assertRaises(uhttp_client.HttpResponseError):
+            reader.feed(buf)
+
+    def test_hex_chunk_size(self):
+        reader = uhttp_client._ChunkedBodyReader()
+        payload = b'x' * 26  # 0x1a
+        buf = bytearray(b'1a\r\n' + payload + b'\r\n0\r\n\r\n')
+        self.assertEqual(reader.feed(buf), payload)
+        self.assertTrue(reader.complete)
+
+
+class TestEofBodyReader(unittest.TestCase):
+    """Tests for _EofBodyReader"""
+
+    def test_reads_all_available(self):
+        reader = uhttp_client._EofBodyReader()
+        buf = bytearray(b'partial data')
+        self.assertEqual(reader.feed(buf), b'partial data')
+        self.assertFalse(reader.complete)
+        self.assertEqual(len(buf), 0)
+
+    def test_accumulates_across_feeds(self):
+        reader = uhttp_client._EofBodyReader()
+        self.assertEqual(reader.feed(bytearray(b'abc')), b'abc')
+        self.assertEqual(reader.feed(bytearray(b'def')), b'def')
+        self.assertFalse(reader.complete)
+
+    def test_eof_completes(self):
+        reader = uhttp_client._EofBodyReader()
+        reader.feed(bytearray(b'data'))
+        reader.feed_eof()
+        self.assertTrue(reader.complete)
+
+    def test_not_keep_alive_capable(self):
+        reader = uhttp_client._EofBodyReader()
+        self.assertFalse(reader.keep_alive_capable)
+
+
 if __name__ == '__main__':
     unittest.main()
