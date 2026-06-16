@@ -290,6 +290,54 @@ class TestEventModeNdjson(unittest.TestCase):
             server.stop()
 
 
+class _ResetSocket:
+    """Fake socket whose recv() raises a given OSError (e.g. ECONNRESET)."""
+
+    def __init__(self, err):
+        self._err = err
+
+    def recv(self, _n):
+        raise self._err
+
+
+class _NoneRecvSocket:
+    """Fake socket: recv() returns None (MicroPython SSL would-block)."""
+
+    def recv(self, _n):
+        return None
+
+
+class TestEofConnReset(unittest.TestCase):
+    """A peer reset/abort (Windows) is end-of-body for close-delimited reads"""
+
+    def test_connreset_is_eof_for_eof_reader(self):
+        import errno
+        client = uhttp_client.HttpClient('127.0.0.1', port=1, event_mode=True)
+        client._body_reader = uhttp_client._EofBodyReader()
+        client._socket = _ResetSocket(OSError(errno.ECONNRESET, 'reset'))
+        # Must not raise; the reset means the body is complete.
+        self.assertTrue(client._recv_to_buffer(100))
+        self.assertTrue(client._body_reader.complete)
+
+    def test_connreset_is_error_for_framed_reader(self):
+        import errno
+        client = uhttp_client.HttpClient('127.0.0.1', port=1, event_mode=True)
+        # Length reader is keep-alive capable: a reset mid-body is a failure.
+        client._body_reader = uhttp_client._LengthBodyReader(100)
+        client._socket = _ResetSocket(OSError(errno.ECONNRESET, 'reset'))
+        with self.assertRaises(uhttp_client.HttpConnectionError):
+            client._recv_to_buffer(100)
+
+    def test_recv_none_is_would_block_not_eof(self):
+        # MicroPython SSL recv() returns None on would-block: must NOT be
+        # mistaken for end-of-body by a close-delimited reader.
+        client = uhttp_client.HttpClient('127.0.0.1', port=1, event_mode=True)
+        client._body_reader = uhttp_client._EofBodyReader()
+        client._socket = _NoneRecvSocket()
+        self.assertFalse(client._recv_to_buffer(100))
+        self.assertFalse(client._body_reader.complete)
+
+
 class TestEventModeError(unittest.TestCase):
     """Connection errors surface as EVENT_ERROR, not exceptions"""
 

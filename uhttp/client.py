@@ -61,6 +61,25 @@ EVENT_COMPLETE = 3   # Body fully received
 EVENT_ERROR = 4      # Error occurred (timeout, disconnect, decode error)
 
 
+def _conn_closed_errnos():
+    """errno values that mean the peer closed the connection.
+
+    On Windows an abortive server close can surface as a reset/abort during
+    recv() instead of an empty read. Built defensively because some errno
+    names are not defined on every MicroPython port.
+    """
+    names = ('ECONNRESET', 'ECONNABORTED', 'ENOTCONN', 'ESHUTDOWN', 'EPIPE')
+    values = []
+    for name in names:
+        value = getattr(errno, name, None)
+        if value is not None:
+            values.append(value)
+    return tuple(values)
+
+
+CONN_CLOSED_ERRNOS = _conn_closed_errnos()
+
+
 class HttpClientError(Exception):
     """HTTP client error"""
 
@@ -1136,9 +1155,22 @@ class HttpClient:
         except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
             return False
         except OSError as err:
-            if err.errno == errno.EAGAIN:
+            if err.errno in (errno.EAGAIN, errno.ENOENT):
+                # EAGAIN: no data yet (non-blocking)
+                # ENOENT: MicroPython SSL would-block / handshake in progress
                 return False
+            # A peer close can surface as a reset/abort during recv (notably
+            # on Windows) instead of an empty read. For close-delimited
+            # bodies that is end-of-body, not an error.
+            if (self._body_reader is not None
+                    and not self._body_reader.keep_alive_capable
+                    and err.errno in CONN_CLOSED_ERRNOS):
+                self._body_reader.feed_eof()
+                return True
             raise HttpConnectionError(f"Recv failed: {err}") from err
+        if data is None:
+            # MicroPython SSL returns None when the recv would block.
+            return False
         if not data:
             # Peer closed the connection. For close-delimited bodies this is
             # the end of the body, not an error.
