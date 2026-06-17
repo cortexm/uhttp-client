@@ -15,6 +15,11 @@ import time as _time
 KB = 2 ** 10
 MB = 2 ** 20
 
+# On Windows a non-blocking recv that would block raises EWOULDBLOCK (10035),
+# which differs from EAGAIN (11); on POSIX they are equal. Defensive getattr
+# because some MicroPython ports do not define EWOULDBLOCK.
+EWOULDBLOCK = getattr(errno, 'EWOULDBLOCK', errno.EAGAIN)
+
 CONNECT_TIMEOUT = 10
 TIMEOUT = 30
 
@@ -59,25 +64,6 @@ EVENT_HEADERS = 1    # Headers received, call accept_body*()
 EVENT_DATA = 2       # Decoded body chunk available, call read_buffer()
 EVENT_COMPLETE = 3   # Body fully received
 EVENT_ERROR = 4      # Error occurred (timeout, disconnect, decode error)
-
-
-def _conn_closed_errnos():
-    """errno values that mean the peer closed the connection.
-
-    On Windows an abortive server close can surface as a reset/abort during
-    recv() instead of an empty read. Built defensively because some errno
-    names are not defined on every MicroPython port.
-    """
-    names = ('ECONNRESET', 'ECONNABORTED', 'ENOTCONN', 'ESHUTDOWN', 'EPIPE')
-    values = []
-    for name in names:
-        value = getattr(errno, name, None)
-        if value is not None:
-            values.append(value)
-    return tuple(values)
-
-
-CONN_CLOSED_ERRNOS = _conn_closed_errnos()
 
 
 class HttpClientError(Exception):
@@ -915,7 +901,7 @@ class HttpClient:
             # implicitly during first send/recv
             pass
         except OSError as err:
-            if err.errno in (errno.EAGAIN, errno.ENOENT):
+            if err.errno in (errno.EAGAIN, EWOULDBLOCK, errno.ENOENT):
                 self._ssl_want_read = True  # MicroPython
                 return
             self._close()
@@ -1155,16 +1141,18 @@ class HttpClient:
         except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
             return False
         except OSError as err:
-            if err.errno in (errno.EAGAIN, errno.ENOENT):
-                # EAGAIN: no data yet (non-blocking)
-                # ENOENT: MicroPython SSL would-block / handshake in progress
+            if err.errno in (errno.EAGAIN, EWOULDBLOCK, errno.ENOENT):
+                # EAGAIN/EWOULDBLOCK: no data yet (non-blocking; the two
+                # differ on Windows). ENOENT: MicroPython SSL would-block.
                 return False
-            # A peer close can surface as a reset/abort during recv (notably
-            # on Windows) instead of an empty read. For close-delimited
-            # bodies that is end-of-body, not an error.
+            # A close-delimited body (EOF reader) ends when the connection
+            # ends. The termination may surface as an empty read OR an error
+            # (reset/abort - notably on Windows, with a platform-specific
+            # errno). Without framing there is no way to tell a clean end from
+            # a truncated one, so treat any non-would-block error as
+            # end-of-body (browsers/curl do the same for HTTP/1.0 close).
             if (self._body_reader is not None
-                    and not self._body_reader.keep_alive_capable
-                    and err.errno in CONN_CLOSED_ERRNOS):
+                    and not self._body_reader.keep_alive_capable):
                 self._body_reader.feed_eof()
                 return True
             raise HttpConnectionError(f"Recv failed: {err}") from err
@@ -1234,8 +1222,8 @@ class HttpClient:
             except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
                 break
             except OSError as err:
-                if err.errno == errno.EAGAIN:
-                    break
+                if err.errno in (errno.EAGAIN, EWOULDBLOCK):
+                    break  # send buffer full (EWOULDBLOCK differs on Windows)
                 raise HttpConnectionError(f"Send failed: {err}") from err
 
         if not self._send_buffer:

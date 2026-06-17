@@ -319,6 +319,26 @@ class TestEofConnReset(unittest.TestCase):
         self.assertTrue(client._recv_to_buffer(100))
         self.assertTrue(client._body_reader.complete)
 
+    def test_any_recv_error_is_eof_for_eof_reader(self):
+        import errno
+        # Windows surfaces the close with a platform-specific errno; for a
+        # close-delimited body any non-would-block error means end-of-body.
+        client = uhttp_client.HttpClient('127.0.0.1', port=1, event_mode=True)
+        client._body_reader = uhttp_client._EofBodyReader()
+        client._socket = _ResetSocket(OSError(errno.ETIMEDOUT, 'boom'))
+        self.assertTrue(client._recv_to_buffer(100))
+        self.assertTrue(client._body_reader.complete)
+
+    def test_wouldblock_is_not_eof_for_eof_reader(self):
+        import errno
+        # Windows non-blocking recv raises EWOULDBLOCK (10035, != EAGAIN).
+        # It means 'no data yet', and must NOT be mistaken for end-of-body.
+        client = uhttp_client.HttpClient('127.0.0.1', port=1, event_mode=True)
+        client._body_reader = uhttp_client._EofBodyReader()
+        client._socket = _ResetSocket(OSError(errno.EWOULDBLOCK, 'wouldblock'))
+        self.assertFalse(client._recv_to_buffer(100))
+        self.assertFalse(client._body_reader.complete)
+
     def test_connreset_is_error_for_framed_reader(self):
         import errno
         client = uhttp_client.HttpClient('127.0.0.1', port=1, event_mode=True)
