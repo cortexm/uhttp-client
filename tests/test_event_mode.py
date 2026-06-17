@@ -43,7 +43,7 @@ class RawServer:
                     if self._delay:
                         time.sleep(self._delay)
             if self._close:
-                conn.close()
+                self._graceful_close(conn)
             else:
                 time.sleep(0.5)
                 conn.close()
@@ -51,6 +51,27 @@ class RawServer:
             pass
         finally:
             self._sock.close()
+
+    @staticmethod
+    def _graceful_close(conn):
+        """Close so all sent bytes are delivered before teardown.
+
+        A plain close() can send a RST that discards in-flight data on
+        Windows (losing a trailing record that has no newline). shutdown()
+        sends a FIN after the data, then we linger until the peer closes so
+        the OS flushes everything first.
+        """
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            conn.settimeout(2.0)
+            while conn.recv(4096):
+                pass
+        except OSError:
+            pass
+        conn.close()
 
     def stop(self):
         try:
