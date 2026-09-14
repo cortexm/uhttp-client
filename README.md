@@ -4,7 +4,7 @@
 ## Features
 
 - MicroPython and CPython compatible
-- Fully non-blocking: TCP connect, SSL handshake, and HTTP I/O via select
+- Fully non-blocking: TCP connect, SSL handshake, and HTTP I/O via `selectors`
 - Keep-alive connections with automatic reuse
 - Fluent API: `response = client.get('/path').wait()`
 - URL parsing with automatic SSL detection
@@ -147,10 +147,11 @@ client.close()
 
 ## Async (non-blocking) mode
 
-Everything is non-blocking by default — TCP connect, SSL handshake, and HTTP I/O all happen through `select()`. This is critical for embedded devices on slow networks (4G modems, ESP32 PPP) where each phase can take seconds.
+Everything is non-blocking by default — TCP connect, SSL handshake, and HTTP I/O all happen through a `selectors.BaseSelector`. This is critical for embedded devices on slow networks (4G modems, ESP32 PPP) where each phase can take seconds.
+
+The client registers its socket in a selector and is driven either by its own `wait()`, or by a shared-selector loop dispatching through `key.data.handle_event()`.
 
 ```python
-import select
 import uhttp.client
 
 client = uhttp.client.HttpClient('http://httpbin.org')
@@ -158,112 +159,107 @@ client = uhttp.client.HttpClient('http://httpbin.org')
 # Start request (non-blocking, including connect)
 client.get('/delay/2')
 
-# Manual select loop - handles connect, send, and receive
-while True:
-    r, w, _ = select.select(
-        client.read_sockets,
-        client.write_sockets,
-        [], 10.0
-    )
-
-    response = client.process_events(r, w)
-    if response:
-        print(response.status)
-        break
+# Manual selector loop - handles connect, send, and receive
+done = False
+while not done:
+    for key, mask in client.selector.select(10.0):
+        if key.data.handle_event(key.fileobj, mask) is not None:
+            print(client.response.status)
+            done = True
+    client.maintenance()   # enforces the deadline; no event can trigger it
 
 client.close()
 ```
 
+`handle_event()` returns the client itself when a result is ready (not the
+value — `EVENT_RESPONSE` is `0` and would be falsy); read it from
+`client.response` or `client.event`.
+
+**Breaking change in v3:** `read_sockets`, `write_sockets` and
+`process_events()` are gone. `select.select()` is no longer used.
+
 ### State machine
 
-After `client.get('/path')`, the client progresses through states automatically via `process_events()`:
+After `client.get('/path')`, the client progresses through states automatically via `handle_event()`:
 
-| State | Description | select watches |
+| State | Description | selector interest |
 |---|---|---|
-| `STATE_CONNECTING` | TCP connect in progress | write |
-| `STATE_SSL_HANDSHAKE` | SSL handshake in progress | read or write |
-| `STATE_SENDING` | Sending request data | write |
-| `STATE_RECEIVING_HEADERS` | Waiting for response headers | read |
-| `STATE_RECEIVING_BODY` | Receiving response body | read |
+| `STATE_CONNECTING` | TCP connect in progress | `EVENT_WRITE` |
+| `STATE_SSL_HANDSHAKE` | SSL handshake in progress | `EVENT_READ`/`EVENT_WRITE` |
+| `STATE_SENDING` | Sending request data | `EVENT_WRITE` |
+| `STATE_RECEIVING_HEADERS` | Waiting for response headers | `EVENT_READ` |
+| `STATE_RECEIVING_BODY` | Receiving response body | `EVENT_READ` |
 | `STATE_COMPLETE` | Response ready | — |
 
 The `state` property exposes the current state. The `is_connected` property returns `True` only after connect and handshake are complete.
 
 ### Parallel requests
 
-All clients share one select loop. Connect, handshake, and data transfer happen concurrently:
+Pass one selector to every client and a single loop drives them all. Connect, handshake, and data transfer happen concurrently:
 
 ```python
-import select
+import selectors
 import uhttp.client
 
+selector = selectors.DefaultSelector()
 clients = [
-    uhttp.client.HttpClient('http://httpbin.org'),
-    uhttp.client.HttpClient('http://httpbin.org'),
-    uhttp.client.HttpClient('http://httpbin.org'),
+    uhttp.client.HttpClient('http://httpbin.org', selector=selector)
+    for _ in range(3)
 ]
 
 # Start all requests (non-blocking connects begin immediately)
 for i, client in enumerate(clients):
     client.get('/delay/1', query={'n': i})
 
-# Single select loop handles all clients
+# Single selector loop handles all clients
 results = {}
 while len(results) < len(clients):
-    read_socks = []
-    write_socks = []
-    for c in clients:
-        read_socks.extend(c.read_sockets)
-        write_socks.extend(c.write_sockets)
-
-    r, w, _ = select.select(read_socks, write_socks, [], 10.0)
-
-    for i, client in enumerate(clients):
-        if i not in results:
-            resp = client.process_events(r, w)
-            if resp:
-                results[i] = resp
+    for key, mask in selector.select(10.0):
+        ready = key.data.handle_event(key.fileobj, mask)
+        if ready is not None:
+            results[clients.index(ready)] = ready.response
+    for client in clients:
+        client.maintenance()
 
 for client in clients:
     client.close()
+selector.close()
 ```
 
 ### Combined with HttpServer
 
-Server and client in the same select loop — true single-threaded concurrency:
+Server and client in the same selector loop — true single-threaded concurrency. Both register in the same selector, and `key.data.handle_event()` dispatches to whichever owns the ready socket:
 
 ```python
-import select
+import selectors
 import uhttp.server
 import uhttp.client
 
-server = uhttp.server.HttpServer(port=8080)
-backend = uhttp.client.HttpClient('http://api.example.com')
+selector = selectors.DefaultSelector()
+server = uhttp.server.HttpServer(port=8080, selector=selector)
+backend = uhttp.client.HttpClient('http://api.example.com', selector=selector)
 
+incoming = None
 while True:
-    r, w, _ = select.select(
-        server.read_sockets + backend.read_sockets,
-        server.write_sockets + backend.write_sockets,
-        [], 1.0
-    )
-
-    # Handle incoming requests
-    incoming = server.process_events(r, w)
-    if incoming:
-        backend.get('/data', query=incoming.query)
-
-    # Handle backend response
-    response = backend.process_events(r, w)
-    if response:
-        incoming.respond(data=response.data)
+    for key, mask in selector.select(1.0):
+        ready = key.data.handle_event(key.fileobj, mask)
+        if ready is None:
+            continue
+        if isinstance(ready, uhttp.server.HttpConnection):
+            incoming = ready                       # request in
+            backend.get('/data', query=ready.query)
+        elif ready is backend and incoming:
+            incoming.respond(data=backend.response.data)   # response out
+            incoming = None
+    server.maintenance()
+    backend.maintenance()   # a hung backend has no event to time out on
 ```
 
 ### HTTPS with non-blocking handshake
 
-SSL handshake is also non-blocking. The client tracks whether `do_handshake()` needs to read or write, and exposes the socket only in the correct direction to prevent `select()` from spinning:
+SSL handshake is also non-blocking. The client tracks whether `do_handshake()` needs to read or write, and arms only that direction to prevent the selector from spinning:
 
 ```python
-import select
 import ssl
 import uhttp.client
 
@@ -271,19 +267,16 @@ ctx = ssl.create_default_context()
 client = uhttp.client.HttpClient(
     'api.example.com', port=443, ssl_context=ctx)
 
-# Connect + SSL handshake + request all happen via select
+# Connect + SSL handshake + request all happen via the selector
 client.get('/data')
 
-while True:
-    r, w, _ = select.select(
-        client.read_sockets,
-        client.write_sockets,
-        [], 10.0
-    )
-    response = client.process_events(r, w)
-    if response:
-        print(response.json())
-        break
+done = False
+while not done:
+    for key, mask in client.selector.select(10.0):
+        if key.data.handle_event(key.fileobj, mask) is not None:
+            print(client.response.json())
+            done = True
+    client.maintenance()
 
 client.close()
 ```
@@ -291,7 +284,7 @@ client.close()
 ### Multiple HTTPS clients in parallel
 
 ```python
-import select
+import selectors
 import uhttp.client
 
 urls = [
@@ -300,28 +293,24 @@ urls = [
     'https://api3.example.com/data',
 ]
 
-clients = [uhttp.client.HttpClient(url) for url in urls]
+selector = selectors.DefaultSelector()
+clients = [
+    uhttp.client.HttpClient(url, selector=selector) for url in urls]
 for c in clients:
     c.get('/')  # All start non-blocking connects + SSL handshakes
 
 responses = [None] * len(clients)
 while not all(responses):
-    read_socks = []
-    write_socks = []
+    for key, mask in selector.select(10.0):
+        ready = key.data.handle_event(key.fileobj, mask)
+        if ready is not None:
+            responses[clients.index(ready)] = ready.response
     for c in clients:
-        read_socks.extend(c.read_sockets)
-        write_socks.extend(c.write_sockets)
-
-    r, w, _ = select.select(read_socks, write_socks, [], 10.0)
-
-    for i, c in enumerate(clients):
-        if responses[i] is None:
-            resp = c.process_events(r, w)
-            if resp:
-                responses[i] = resp
+        c.maintenance()
 
 for c in clients:
     c.close()
+selector.close()
 ```
 
 
@@ -329,9 +318,10 @@ for c in clients:
 
 For large or open-ended responses (downloads, NDJSON, MJPEG, SSE) the client
 offers an **event mode** that mirrors uhttp-server's `HttpConnection` API.
-With `event_mode=True`, `wait()` / `process_events()` return `EVENT_*`
-constants instead of an `HttpResponse`, and you choose how the body is
-delivered after the headers arrive.
+With `event_mode=True`, `wait()` returns `EVENT_*` constants instead of an
+`HttpResponse`, and you choose how the body is delivered after the headers
+arrive. (`handle_event()` returns `self`/`None` in both modes — read the value
+from `client.event`.)
 
 ### Events
 
@@ -343,7 +333,7 @@ delivered after the headers arrive.
 | `EVENT_COMPLETE` | Body fully received |
 | `EVENT_ERROR` | Connection or decode error → message in `client.error` (no exception) |
 
-Names and numeric values match uhttp-server, so the same select loop can drive
+Names and numeric values match uhttp-server, so the same selector loop can drive
 both a server and a client.
 
 ### Body delivery (choose after `EVENT_HEADERS`)
@@ -361,7 +351,6 @@ new event type.
 ### NDJSON streaming
 
 ```python
-import select
 from uhttp.client import (
     HttpClient, EVENT_HEADERS, EVENT_DATA, EVENT_COMPLETE, EVENT_ERROR)
 
@@ -369,8 +358,7 @@ client = HttpClient('http://api.example.com', event_mode=True)
 client.get('/events.ndjson', stream=True)   # stream until close if unframed
 
 while True:
-    r, w, _ = select.select(client.read_sockets, client.write_sockets, [], 30)
-    event = client.process_events(r, w)
+    event = client.wait(30)   # drains next() first, then selects
 
     if event == EVENT_HEADERS:
         client.accept_ndjson()
@@ -397,8 +385,7 @@ client = HttpClient('http://example.com', event_mode=True)
 client.get('/firmware.bin')
 
 while True:
-    r, w, _ = select.select(client.read_sockets, client.write_sockets, [], 10)
-    event = client.process_events(r, w)
+    event = client.wait(10)
     if event == EVENT_HEADERS:
         client.accept_body_to_file('/sd/firmware.bin')
     elif event == EVENT_COMPLETE:
@@ -483,8 +470,12 @@ Parameters:
 - `connect_timeout` - Connection timeout in seconds (default: 10)
 - `timeout` - Response timeout in seconds (default: 30)
 - `max_response_length` - Maximum buffered body size (default: 1MB)
-- `event_mode` - If `True`, `wait()`/`process_events()` return `EVENT_*`
-  constants instead of `HttpResponse` (see [Streaming & Event Mode](#streaming--event-mode))
+- `event_mode` - If `True`, `wait()` returns `EVENT_*` constants instead of
+  `HttpResponse` (see [Streaming & Event Mode](#streaming--event-mode))
+- `selector` - A `selectors.BaseSelector` to register the socket in (default: a
+  `DefaultSelector` the client owns and closes). Pass the same instance to
+  several clients / servers to drive them from one loop — then drive it with
+  `handle_event()` + `maintenance()`, because `wait()` needs an owned selector.
 
 #### Properties
 
@@ -495,8 +486,9 @@ Parameters:
 - `state` - Current state (STATE_IDLE, STATE_CONNECTING, STATE_SSL_HANDSHAKE, STATE_SENDING, etc.)
 - `auth` - Authentication credentials tuple (username, password) or None
 - `cookies` - Cookies dict (persistent across requests)
-- `read_sockets` - Sockets to monitor for reading (for select)
-- `write_sockets` - Sockets to monitor for writing (for select)
+- `selector` - The `selectors.BaseSelector` the client registers its socket in.
+  Read events from it and dispatch via `key.data.handle_event()` for a
+  shared-selector loop across several clients / servers / your own sockets.
 
 Event-mode properties (available once headers are received):
 
@@ -543,22 +535,52 @@ Start HTTP request (async). Returns `self` for chaining.
 
 Wait for response (blocking).
 
+Single-client convenience backed by the client's own selector: it drains
+`next()` first, then selects and dispatches.
+
+**Requires an owned selector.** A blocking wait cannot service the other
+owners' ready keys of a shared selector, and level-triggered readiness would
+hand them back on every call — a busy spin. With an injected selector `wait()`
+raises `HttpClientError`; drive that loop yourself with `handle_event()` and
+`maintenance()`.
+
 - Classic mode: returns `HttpResponse` when complete; raises `HttpTimeoutError`
-  if the request timeout expires; returns `None` if the wait timeout expires
-  (connection stays open, can call again).
-- Event mode: returns the next `EVENT_*` constant, or `None` when the wait
-  timeout expires with nothing new.
+  (and closes the connection) when the request or wait timeout expires.
+- Event mode: returns the next `EVENT_*` constant, or `None` when the timeout
+  expires with nothing new (the connection stays open — call again).
 - `timeout` - Max time to spend in wait() call. If `None`, uses request timeout.
 
-**`process_events(read_sockets, write_sockets)`**
+**`handle_event(fileobj, mask)`**
 
-Process select events from an external select loop.
+Owner dispatch for a selector event (the client is stored as `key.data`).
+Drives read/write for the given readiness `mask` and returns the client itself
+when a result is ready, else `None`. Read the result from `response` (classic
+mode) or `event` (event mode) — it returns `self` rather than the value
+because `EVENT_RESPONSE` is `0` and would be falsy.
 
-- Classic mode: returns `HttpResponse` when complete (`None` otherwise); raises
-  on errors.
-- Event mode: returns an `EVENT_*` constant (`None` when nothing new yet);
-  connection/decode errors surface as `EVENT_ERROR` with the message in
-  `client.error`.
+In classic mode connection errors raise; in event mode they surface as
+`EVENT_ERROR` with the message in `error`.
+
+**`next()`**
+
+Process a result already buffered locally, returning `True` while another one
+is ready. One `recv()` can carry several NDJSON records or body chunks, and an
+SSL socket can hold decrypted bytes the selector will never report — both are
+invisible to the selector, so drain with `next()` before blocking again.
+`wait()` does this for you.
+
+**`maintenance()`**
+
+Enforce the request deadline and expire an idle kept-alive connection. A
+shared-selector loop only calls `handle_event()` for *ready* keys, so a hung
+peer would otherwise leave the request pending forever — call this once per
+loop iteration (`wait()` does it for you). Classic mode raises
+`HttpTimeoutError`; event mode returns the client with `EVENT_ERROR` in
+`event`, else `None`.
+
+It also applies the server's `Keep-Alive` hint to an idle connection, though
+the hint is honoured on reuse as well, so a plain `get().wait()` caller does
+not have to schedule `maintenance()` for that alone.
 
 #### Event-mode body methods
 
@@ -721,6 +743,30 @@ for i in range(10):
 client.close()
 ```
 
+### How it actually works
+
+HTTP/1.1 keep-alive sends **nothing** over the wire while idle — it is only an
+agreement not to close the socket after the response. (The thing that does send
+idle probes is TCP `SO_KEEPALIVE`, a different layer handled by the kernel.)
+Either side may close at any time without announcing it, so the client handles
+it in three ways:
+
+1. **The idle socket stays armed for reading.** On an idle HTTP/1.1 connection
+   the server must not send anything, so readability means the peer closed —
+   the client drops the socket right away instead of discovering it on the next
+   request. Needs a running loop (`wait()` or a shared selector).
+2. **The `Keep-Alive: timeout=5, max=100` hint is honoured.** If the server
+   advertises its idle limit, `maintenance()` closes slightly before it (90% of
+   the advertised timeout), so a new request never races the server's close.
+3. **One transparent replay.** If a *reused* connection dies before any
+   response byte arrives, the client reconnects and resends — once, and only
+   for idempotent methods (GET/HEAD/PUT/DELETE/OPTIONS/TRACE). A non-idempotent
+   request may already have been processed by the server, so it is reported
+   instead.
+
+Together these mean an idle connection that the server recycles is normally
+invisible to your code.
+
 
 ## Timeouts
 
@@ -760,21 +806,31 @@ Both `connect_timeout` and `timeout` are checked during connect/handshake phases
 
 ### Wait timeout
 
-Time to spend in `wait()` call. When expired, returns `None` but keeps connection open.
-Useful for polling or interleaving with other work.
+Time to spend in a single `wait()` call.
+
+In **classic mode** an expired wait raises `HttpTimeoutError` and closes the
+connection — it is not a poll. To interleave with other work, use event mode,
+where `wait()` returns `None` on expiry and the request stays alive:
 
 ```python
 import uhttp.client
+from uhttp.client import EVENT_RESPONSE, EVENT_ERROR
 
-client = uhttp.client.HttpClient('https://example.com', timeout=60)  # request timeout
+client = uhttp.client.HttpClient(
+    'https://example.com', timeout=60, event_mode=True)
 client.get('/slow')
 
-# Try for 5 seconds, then do something else
-response = client.wait(timeout=5)
-if response is None:
-    print("Still waiting, doing other work...")
-    # Can call wait() again
-    response = client.wait(timeout=10)
+while True:
+    event = client.wait(timeout=5)   # None once per idle 5s slice
+    if event is None:
+        print("Still waiting, doing other work...")
+        continue
+    if event == EVENT_RESPONSE:
+        print(client.response.status)
+        break
+    if event == EVENT_ERROR:
+        print(client.error)
+        break
 ```
 
 
@@ -815,7 +871,7 @@ MAX_RESPONSE_LENGTH = 1MB
 See [examples/](../examples/) directory:
 - `client_basic.py` - Basic blocking examples
 - `client_https.py` - HTTPS examples
-- `client_async.py` - Async select loop examples
+- `client_async.py` - Async selector loop examples (incl. shared selector)
 - `client_stream.py` - Event-mode streaming (download-to-file, chunks, NDJSON)
 - `client_with_server.py` - Combined server + client examples
 

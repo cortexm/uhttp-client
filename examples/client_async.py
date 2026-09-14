@@ -1,6 +1,7 @@
-"""Non-blocking (async) HTTP client examples using select"""
+"""Non-blocking (async) HTTP client examples using selectors"""
 
-import select
+import selectors
+
 from uhttp.client import HttpClient
 
 
@@ -14,19 +15,16 @@ def example_single_async():
     client.get('/get', query={'mode': 'async'})
     print("Request started, waiting for response...")
 
-    # Manual select loop
-    while True:
-        r, w, _ = select.select(
-            client.read_sockets,
-            client.write_sockets,
-            [], 10.0  # timeout
-        )
-
-        response = client.process_events(r, w)
-        if response:
-            print(f"Response: status={response.status}")
-            print(f"Data: {response.json()['args']}")
-            break
+    # Manual selector loop - handles connect, send, and receive
+    done = False
+    while not done:
+        for key, mask in client.selector.select(10.0):
+            if key.data.handle_event(key.fileobj, mask) is not None:
+                response = client.response
+                print(f"Response: status={response.status}")
+                print(f"Data: {response.json()['args']}")
+                done = True
+        client.maintenance()   # deadline has no event to ride on
 
     client.close()
 
@@ -35,11 +33,11 @@ def example_parallel_requests():
     """Multiple clients working in parallel"""
     print("\n=== Parallel Requests ===")
 
-    # Create multiple clients
+    # One shared selector drives every client from a single loop
+    selector = selectors.DefaultSelector()
     clients = [
-        HttpClient('httpbin.org', port=80),
-        HttpClient('httpbin.org', port=80),
-        HttpClient('httpbin.org', port=80),
+        HttpClient('httpbin.org', port=80, selector=selector)
+        for _ in range(3)
     ]
 
     # Start all requests (async is default)
@@ -50,26 +48,20 @@ def example_parallel_requests():
     # Wait for all responses
     responses = {}
     while len(responses) < len(clients):
-        # Collect all sockets
-        read_socks = []
-        write_socks = []
+        for key, mask in selector.select(10.0):
+            ready = key.data.handle_event(key.fileobj, mask)
+            if ready is None:
+                continue
+            index = clients.index(ready)
+            responses[index] = ready.response
+            print(f"Client {index} done: status={ready.response.status}")
         for client in clients:
-            read_socks.extend(client.read_sockets)
-            write_socks.extend(client.write_sockets)
-
-        r, w, _ = select.select(read_socks, write_socks, [], 10.0)
-
-        # Process events for each client
-        for i, client in enumerate(clients):
-            if i not in responses:
-                resp = client.process_events(r, w)
-                if resp:
-                    responses[i] = resp
-                    print(f"Client {i} done: status={resp.status}")
+            client.maintenance()
 
     # Cleanup
     for client in clients:
         client.close()
+    selector.close()
 
     print(f"All {len(responses)} requests completed in parallel")
 
@@ -90,16 +82,13 @@ def example_mixed_operations():
     for method, path, json_data in operations:
         client.request(method, path, json=json_data)  # async is default
 
-        while True:
-            r, w, _ = select.select(
-                client.read_sockets,
-                client.write_sockets,
-                [], 5.0
-            )
-            response = client.process_events(r, w)
-            if response:
-                print(f"{method} {path}: status={response.status}")
-                break
+        done = False
+        while not done:
+            for key, mask in client.selector.select(5.0):
+                if key.data.handle_event(key.fileobj, mask) is not None:
+                    print(f"{method} {path}: status={client.response.status}")
+                    done = True
+            client.maintenance()
 
     client.close()
 
@@ -115,21 +104,20 @@ def example_with_timeout_handling():
     elapsed = 0
 
     while elapsed < timeout_seconds:
-        r, w, _ = select.select(
-            client.read_sockets,
-            client.write_sockets,
-            [], 1.0  # 1 second intervals
-        )
+        events = client.selector.select(1.0)  # 1 second intervals
 
-        if not r and not w:
+        if not events:
             elapsed += 1
             print(f"Waiting... {elapsed}s")
             continue
 
-        response = client.process_events(r, w)
-        if response:
-            print(f"Response received: status={response.status}")
-            break
+        for key, mask in events:
+            if key.data.handle_event(key.fileobj, mask) is not None:
+                print(f"Response received: status={client.response.status}")
+                break
+        else:
+            continue
+        break
     else:
         print("Request timed out!")
 

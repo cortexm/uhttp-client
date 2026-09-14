@@ -2,12 +2,13 @@
 """
 HTTP client async (non-blocking) tests
 """
-import unittest
+import selectors
 import threading
 import time
-import select
-from uhttp import server as uhttp_server
+import unittest
+
 from uhttp import client as uhttp_client
+from uhttp import server as uhttp_server
 
 
 class TestClientAsync(unittest.TestCase):
@@ -45,19 +46,16 @@ class TestClientAsync(unittest.TestCase):
             cls.server.close()
             cls.server = None
 
-    def test_process_events(self):
-        """Test async processing with process_events"""
+    def test_handle_event(self):
+        """Test async processing via selector + handle_event()"""
         client = uhttp_client.HttpClient('127.0.0.1', port=self.PORT)
         client.get('/test')
 
         response = None
         for _ in range(100):
-            r, w, _ = select.select(
-                client.read_sockets,
-                client.write_sockets,
-                [], 0.1
-            )
-            response = client.process_events(r, w)
+            for key, mask in client.selector.select(0.1):
+                if key.data.handle_event(key.fileobj, mask) is not None:
+                    response = client.response
             if response:
                 break
 
@@ -65,12 +63,12 @@ class TestClientAsync(unittest.TestCase):
         self.assertEqual(response.status, 200)
         client.close()
 
-    def test_read_write_sockets_before_request(self):
-        """Test socket lists are empty before request"""
+    def test_nothing_registered_before_request(self):
+        """Test the selector is empty before a request starts"""
         client = uhttp_client.HttpClient('127.0.0.1', port=self.PORT)
 
-        self.assertEqual(client.read_sockets, [])
-        self.assertEqual(client.write_sockets, [])
+        self.assertIsNone(client._interest)
+        self.assertEqual(client.selector.get_map(), {})
 
         client.close()
 
@@ -102,10 +100,12 @@ class TestClientAsync(unittest.TestCase):
 
         client.close()
 
-    def test_multiple_clients_select(self):
-        """Test multiple clients in single select loop"""
+    def test_multiple_clients_shared_selector(self):
+        """Test multiple clients driven by one shared selector"""
+        selector = selectors.DefaultSelector()
         clients = [
-            uhttp_client.HttpClient('127.0.0.1', port=self.PORT)
+            uhttp_client.HttpClient(
+                '127.0.0.1', port=self.PORT, selector=selector)
             for _ in range(3)
         ]
 
@@ -113,28 +113,14 @@ class TestClientAsync(unittest.TestCase):
         for i, client in enumerate(clients):
             client.get(f'/path{i}')
 
-        # Collect responses
+        # One loop collects every response
         responses = [None] * len(clients)
-        for _ in range(100):
-            read_socks = []
-            write_socks = []
-            for c in clients:
-                read_socks.extend(c.read_sockets)
-                write_socks.extend(c.write_sockets)
-
-            if not read_socks and not write_socks:
-                break
-
-            r, w, _ = select.select(read_socks, write_socks, [], 0.1)
-
-            for i, client in enumerate(clients):
-                if responses[i] is None:
-                    resp = client.process_events(r, w)
-                    if resp:
-                        responses[i] = resp
-
-            if all(r is not None for r in responses):
-                break
+        deadline = time.time() + 10
+        while None in responses and time.time() < deadline:
+            for key, mask in selector.select(0.1):
+                ready = key.data.handle_event(key.fileobj, mask)
+                if ready is not None:
+                    responses[clients.index(ready)] = ready.response
 
         for i, resp in enumerate(responses):
             self.assertIsNotNone(resp)
@@ -143,27 +129,27 @@ class TestClientAsync(unittest.TestCase):
 
         for client in clients:
             client.close()
+        selector.close()
 
-    def test_process_events_idle_returns_none(self):
-        """Test process_events returns None when idle"""
+    def test_handle_event_idle_returns_none(self):
+        """Test handle_event returns None when idle"""
         client = uhttp_client.HttpClient('127.0.0.1', port=self.PORT)
 
-        result = client.process_events([], [])
-        self.assertIsNone(result)
+        self.assertIsNone(client.handle_event(None, 0))
 
         client.close()
 
-    def test_process_events_timeout(self):
-        """Test process_events raises HttpTimeoutError on timeout"""
+    def test_handle_event_timeout(self):
+        """Test handle_event raises HttpTimeoutError on timeout"""
         client = uhttp_client.HttpClient('127.0.0.1', port=self.PORT, timeout=0.1)
         client.get('/slow')  # Server sleeps 0.2s
 
         # Wait until timeout expires
         time.sleep(0.2)
 
-        # process_events should raise timeout
+        # handle_event should raise timeout
         with self.assertRaises(uhttp_client.HttpTimeoutError):
-            client.process_events([], [])
+            client.handle_event(client._socket, 0)
 
         client.close()
 
@@ -177,9 +163,9 @@ class TestClientAsync(unittest.TestCase):
         # Wait until timeout expires
         time.sleep(0.2)
 
-        # process_events should raise timeout
+        # handle_event should raise timeout
         with self.assertRaises(uhttp_client.HttpTimeoutError):
-            client.process_events([], [])
+            client.handle_event(client._socket, 0)
 
         client.close()
 

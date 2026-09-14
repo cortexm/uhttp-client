@@ -403,8 +403,9 @@ class TestHttpClientInit(unittest.TestCase):
         self.assertEqual(client.state, uhttp_client.STATE_IDLE)
         self.assertFalse(client.is_connected)
         self.assertEqual(client.cookies, {})
-        self.assertEqual(client.read_sockets, [])
-        self.assertEqual(client.write_sockets, [])
+        # v3: nothing is registered in the selector until a request starts
+        self.assertIsNone(client._interest)
+        self.assertEqual(client.selector.get_map(), {})
         client.close()
 
     def test_context_manager(self):

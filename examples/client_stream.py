@@ -1,12 +1,14 @@
 """Event-mode streaming examples (event_mode=True).
 
-In event mode wait()/process_events() return EVENT_* constants instead of an
-HttpResponse, mirroring uhttp-server's HttpConnection event API. After
-EVENT_HEADERS you choose how the body is delivered with an accept_body*()
-variant.
+In event mode wait() returns EVENT_* constants instead of an HttpResponse,
+mirroring uhttp-server's HttpConnection event API. After EVENT_HEADERS you
+choose how the body is delivered with an accept_body*() variant.
+
+wait() drives the client's own selector and drains locally buffered events
+via next(), so one recv() carrying several records is delivered one by one.
+For a shared-selector loop across several clients see client_async.py.
 """
 
-import select
 from uhttp.client import (
     HttpClient,
     EVENT_RESPONSE, EVENT_HEADERS, EVENT_DATA, EVENT_COMPLETE, EVENT_ERROR)
@@ -20,9 +22,7 @@ def example_small_response():
     client.get('/get', query={'mode': 'event'})
 
     while True:
-        r, w, _ = select.select(
-            client.read_sockets, client.write_sockets, [], 10.0)
-        event = client.process_events(r, w)
+        event = client.wait(10.0)
 
         if event == EVENT_RESPONSE:
             # Completed body: read it as a full HttpResponse (reuses .json())
@@ -44,9 +44,7 @@ def example_download_to_file():
     client.get('/bytes/4096')
 
     while True:
-        r, w, _ = select.select(
-            client.read_sockets, client.write_sockets, [], 10.0)
-        event = client.process_events(r, w)
+        event = client.wait(10.0)
 
         if event == EVENT_HEADERS:
             print("downloading", client.content_length, "bytes")
@@ -70,9 +68,7 @@ def example_stream_chunks():
     client.get('/stream-bytes/8192')
 
     while True:
-        r, w, _ = select.select(
-            client.read_sockets, client.write_sockets, [], 10.0)
-        event = client.process_events(r, w)
+        event = client.wait(10.0)
 
         if event == EVENT_HEADERS:
             client.accept_body_streaming()
@@ -99,9 +95,7 @@ def example_ndjson():
 
     count = 0
     while True:
-        r, w, _ = select.select(
-            client.read_sockets, client.write_sockets, [], 30.0)
-        event = client.process_events(r, w)
+        event = client.wait(30.0)
 
         if event == EVENT_HEADERS:
             client.accept_ndjson()

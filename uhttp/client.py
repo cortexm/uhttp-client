@@ -3,13 +3,13 @@ python or micropython
 (c) 2026 Pavel Revak <pavelrevak@gmail.com>
 """
 
-import errno
-import socket as _socket
-import select as _select
-import json as _json
-import ssl as _ssl
 import binascii as _binascii
+import errno
 import hashlib as _hashlib
+import json as _json
+import selectors as _selectors
+import socket as _socket
+import ssl as _ssl
 import time as _time
 
 KB = 2 ** 10
@@ -57,6 +57,8 @@ CONTENT_TYPE_OCTET_STREAM = 'application/octet-stream'
 CONNECTION = 'connection'
 CONNECTION_CLOSE = 'close'
 CONNECTION_KEEP_ALIVE = 'keep-alive'
+KEEP_ALIVE_HEADER = 'keep-alive'
+KEEP_ALIVE_SAFETY_FACTOR = 0.9  # close before the server's advertised timeout
 COOKIE = 'cookie'
 SET_COOKIE = 'set-cookie'
 HOST = 'host'
@@ -69,6 +71,9 @@ WWW_AUTHENTICATE = 'www-authenticate'
 EXPECT = 'expect'
 EXPECT_100_CONTINUE = '100-continue'
 
+# Safe to replay when a reused connection died before answering
+IDEMPOTENT_METHODS = ('GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE')
+
 STATE_IDLE = 0
 STATE_CONNECTING = 1
 STATE_SSL_HANDSHAKE = 2
@@ -79,7 +84,7 @@ STATE_COMPLETE = 6
 STATE_WAITING_100_CONTINUE = 7
 STATE_HEADERS_READY = 8
 
-# Event types returned by wait()/process_events() in event mode.
+# Event types returned by wait()/handle_event() in event mode.
 # Names and numeric values mirror uhttp-server's HttpConnection events.
 EVENT_RESPONSE = 0   # Complete response (headers + body) in one step
 EVENT_HEADERS = 1    # Headers received, call accept_body*()
@@ -596,7 +601,8 @@ class HttpClient:
     def __init__(
             self, url_or_host, port=None, ssl_context=None, auth=None,
             connect_timeout=CONNECT_TIMEOUT, timeout=TIMEOUT,
-            max_response_length=MAX_RESPONSE_LENGTH, event_mode=False):
+            max_response_length=MAX_RESPONSE_LENGTH, event_mode=False,
+            selector=None):
         # Parse URL if provided
         if '://' in url_or_host or url_or_host.startswith('http'):
             host, parsed_port, base_path, use_ssl, url_auth = parse_url(
@@ -661,6 +667,17 @@ class HttpClient:
         self._bytes_received = 0
         self._record_decoder = None
         self._records = []
+
+        self._keep_alive_timeout = None
+        self._keep_alive_max = None
+        self._requests_on_connection = 0
+        self._idle_since = None
+        self._connection_reused = False
+        self._retried_stale = False
+
+        self._owns_selector = selector is None
+        self._selector = selector or _selectors.DefaultSelector()
+        self._interest = None
 
         self._cookies = {}
 
@@ -751,28 +768,69 @@ class HttpClient:
         return self._bytes_received
 
     @property
-    def read_sockets(self):
-        if self._socket and self._state == STATE_SSL_HANDSHAKE:
-            return [self._socket] if self._ssl_want_read else []
-        if self._socket and self._state in (
-                STATE_WAITING_100_CONTINUE,
-                STATE_RECEIVING_HEADERS, STATE_RECEIVING_BODY):
-            return [self._socket]
-        return []
+    def selector(self):
+        """The selectors.BaseSelector this client registers its socket in.
+
+        Shared-selector loops read events from here and dispatch via
+        key.data.handle_event(); see wait() for the single-client case.
+        """
+        return self._selector
 
     @property
     def state(self):
         return self._state
 
-    @property
-    def write_sockets(self):
-        if self._socket and self._state == STATE_CONNECTING:
-            return [self._socket]
-        if self._socket and self._state == STATE_SSL_HANDSHAKE:
-            return [self._socket] if not self._ssl_want_read else []
-        if self._socket and self._state == STATE_SENDING and self._send_buffer:
-            return [self._socket]
-        return []
+    def _ensure_selector(self):
+        if self._owns_selector and self._selector.get_map() is None:
+            self._selector = _selectors.DefaultSelector()
+
+    def _selector_call(self, method, *args):
+        try:
+            getattr(self._selector, method)(self._socket, *args)
+        except (KeyError, ValueError, OSError):
+            return False
+        return True
+
+    def _wanted_interest(self):
+        if self._socket is None:
+            return 0
+        if self._state == STATE_CONNECTING:
+            return _selectors.EVENT_WRITE
+        if self._state == STATE_SSL_HANDSHAKE:
+            return (_selectors.EVENT_READ if self._ssl_want_read
+                    else _selectors.EVENT_WRITE)
+        if self._state == STATE_SENDING:
+            return _selectors.EVENT_WRITE if self._send_buffer else 0
+        if self._state in (
+                STATE_WAITING_100_CONTINUE,
+                STATE_RECEIVING_HEADERS, STATE_RECEIVING_BODY):
+            return _selectors.EVENT_READ
+        if self._state == STATE_IDLE:
+            return _selectors.EVENT_READ
+        return 0
+
+    def _unregister(self):
+        if self._interest is not None and self._socket is not None:
+            self._selector_call('unregister')
+        self._interest = None
+
+    def _update_interest(self):
+        want = self._wanted_interest()
+        if want == self._interest:
+            return
+        if not want:
+            self._unregister()
+            return
+        if self._interest is None:
+            method = 'register'
+        else:
+            method = 'modify'
+        if self._selector_call(method, want, self):
+            self._interest = want
+        else:
+            self._close()
+            raise HttpConnectionError(
+                f"Cannot arm selector ({method})")
 
     def _build_request(
             self, method, path, headers=None, data=None, query=None,
@@ -847,16 +905,22 @@ class HttpClient:
 
     def _close(self):
         if self._socket:
+            self._unregister()
             try:
                 self._socket.close()
             except OSError:
                 pass
             self._socket = None
+        self._interest = None
         self._state = STATE_IDLE
         self._buffer = bytearray()
         self._send_buffer = bytearray()
         self._body = bytearray()
         self._body_reader = None
+        self._keep_alive_timeout = None
+        self._keep_alive_max = None
+        self._requests_on_connection = 0
+        self._idle_since = None
 
     def _connect(self):
         if self._socket is not None:
@@ -913,6 +977,7 @@ class HttpClient:
 
     def _wrap_ssl(self):
         """Wrap socket with SSL and start non-blocking handshake"""
+        self._unregister()
         try:
             self._socket = self._ssl_context.wrap_socket(
                 self._socket, server_hostname=self._host,
@@ -1024,8 +1089,10 @@ class HttpClient:
         if not self._should_keep_alive():
             self._close()
         else:
+            self._note_keep_alive()
             self._reset_request()
             self._state = STATE_IDLE
+            self._idle_since = _time.time()
 
         return response
 
@@ -1272,6 +1339,7 @@ class HttpClient:
             self._request_start_time = None
             self._request_expect_continue = False
             self._request_stream = False
+            self._retried_stale = False
         self._response_status = None
         self._response_status_message = None
         self._response_headers = None
@@ -1324,8 +1392,14 @@ class HttpClient:
                 self._state = STATE_RECEIVING_HEADERS
 
     def close(self):
-        """Close connection"""
+        """Close the connection and, if owned, the selector"""
         self._close()
+        self._close_body_file()
+        if self._owns_selector:
+            try:
+                self._selector.close()
+            except OSError:
+                pass
 
     def delete(self, path, **kwargs):
         """Send DELETE request"""
@@ -1347,48 +1421,172 @@ class HttpClient:
         """Send POST request"""
         return self.request('POST', path, **kwargs)
 
-    def process_events(self, read_sockets, write_sockets):
-        """Process select events from an external select loop.
+    def handle_event(self, fileobj, mask):
+        """Owner dispatch for a selector event.
 
-        Classic mode: returns HttpResponse when the response is complete
-        (or None), and raises on errors.
+        Returns this client when a result is ready - the completed response
+        in .response (classic mode), or the EVENT_* constant in .event
+        (event mode) - else None.
 
-        Event mode: returns an EVENT_* constant (or None when there is
-        nothing new yet); connection errors surface as EVENT_ERROR with the
-        message in client.error.
+        A readable idle connection means the peer closed it: the socket is
+        dropped so the next request reconnects, and None is returned.
         """
-        if self._event_mode:
-            return self._process_events_eventmode(read_sockets, write_sockets)
-        return self._process_events_classic(read_sockets, write_sockets)
-
-    def _process_events_classic(self, read_sockets, write_sockets):
         if self._state == STATE_IDLE:
+            if mask & _selectors.EVENT_READ:
+                self._drop_idle_connection()
             return None
+        if self._event_mode:
+            ready = self._handle_eventmode(mask)
+        else:
+            ready = self._handle_classic(mask)
+        try:
+            self._update_interest()
+        except HttpConnectionError as err:
+            if not self._event_mode:
+                raise
+            return self if self._fail_event(str(err)) else None
+        return self if ready else None
+
+    def _drop_idle_connection(self):
+        self._close()
+
+    def next(self):
+        """Process a result that is already buffered locally.
+
+        One recv() can carry several records or body chunks, and an SSL
+        socket can hold decrypted bytes the selector will never report.
+        Returns True while another result/event is ready on this client.
+        """
+        if self._state in (STATE_IDLE, STATE_HEADERS_READY):
+            return False
+        if not (self._has_ssl_pending() or self._has_pending_body()):
+            return False
+        return self.handle_event(self._socket, 0) is not None
+
+    def maintenance(self):
+        """Housekeeping that no selector event can trigger.
+
+        Enforces the request deadline, and expires an idle kept-alive
+        connection once the server's Keep-Alive hint runs out. A shared
+        selector loop only calls handle_event() for ready keys, so a hung
+        peer would leave the request pending forever - call this once per
+        loop iteration (wait() does it for you). It is O(1), so there is no
+        need to rate limit it.
+
+        Classic mode raises HttpTimeoutError; event mode returns this client
+        with EVENT_ERROR in .event, else None.
+        """
+        if self._state == STATE_IDLE:
+            self._expire_idle_connection()
+            return None
+        if not self._event_mode:
+            self._check_deadline()
+            return None
+        return self if self._deadline_event() else None
+
+    def _can_retry_stale(self):
+        if not self._connection_reused or self._retried_stale:
+            return False
+        if self._response_status is not None or self._buffer:
+            return False
+        return self._request_method in IDEMPOTENT_METHODS
+
+    def _restart_stale_connection(self):
+        self._retried_stale = True
+        self._close()
+        self._reset_request(clear_request=False)
+        self._start_request()
+
+    def _fail_event(self, message):
+        self._error = message
+        self._close()
+        self._event = EVENT_ERROR
+        return True
+
+    def _note_keep_alive(self):
+        self._requests_on_connection += 1
+        self._keep_alive_timeout = None
+        self._keep_alive_max = None
+        value = self._response_headers.get(KEEP_ALIVE_HEADER)
+        if not value:
+            return
+        for part in value.split(','):
+            if '=' not in part:
+                continue
+            name, raw = part.split('=', 1)
+            raw = raw.strip()
+            if not raw.isdigit():
+                continue
+            name = name.strip().lower()
+            if name == 'timeout':
+                self._keep_alive_timeout = int(raw)
+            elif name == 'max':
+                self._keep_alive_max = int(raw)
+
+    def _expire_idle_connection(self):
+        if self._socket is None:
+            return
+        if (self._keep_alive_max is not None
+                and self._requests_on_connection >= self._keep_alive_max):
+            self._close()
+            return
+        if self._keep_alive_timeout is None or self._idle_since is None:
+            return
+        limit = self._keep_alive_timeout * KEEP_ALIVE_SAFETY_FACTOR
+        if _time.time() - self._idle_since >= limit:
+            self._close()
+
+    def _check_deadline(self):
+        if self._state == STATE_IDLE or self._request_start_time is None:
+            return
+        if self._state in (STATE_CONNECTING, STATE_SSL_HANDSHAKE):
+            self._check_connect_timeout()
+            return
+        if self._event_mode and self._state not in (
+                STATE_SENDING, STATE_RECEIVING_HEADERS,
+                STATE_WAITING_100_CONTINUE):
+            return
+        timeout = (self._request_timeout
+                   if self._request_timeout is not None
+                   else self._timeout)
+        if timeout and _time.time() - self._request_start_time > timeout:
+            self._close()
+            raise HttpTimeoutError("Request timed out")
+
+    def _deadline_event(self):
+        try:
+            self._check_deadline()
+        except (HttpConnectionError, HttpTimeoutError) as err:
+            return self._fail_event(str(err))
+        return False
+
+    def _handle_classic(self, mask):
+        if self._state == STATE_IDLE:
+            return False
 
         try:
             # Handle non-blocking connect completion
             if self._state == STATE_CONNECTING:
-                if self._socket in write_sockets:
+                if mask & _selectors.EVENT_WRITE:
                     self._process_connecting()
                 if self._state == STATE_CONNECTING:
                     self._check_connect_timeout()
-                    return None
+                    return False
 
             # Handle non-blocking SSL handshake
             if self._state == STATE_SSL_HANDSHAKE:
-                if (self._socket in read_sockets
-                        or self._socket in write_sockets):
+                if mask:
                     self._process_ssl_handshake()
                 if self._state == STATE_SSL_HANDSHAKE:
                     self._check_connect_timeout()
-                    return None
+                    return False
 
             # Send request data
-            if self._socket in write_sockets and self._state == STATE_SENDING:
+            if mask & _selectors.EVENT_WRITE and self._state == STATE_SENDING:
                 self._try_send()
 
-            # SSL may buffer decrypted data internally that select() can't see
-            socket_readable = (self._socket in read_sockets or
+            # SSL may buffer decrypted data internally the selector can't see
+            socket_readable = (mask & _selectors.EVENT_READ or
                                self._has_ssl_pending())
             if socket_readable:
                 if self._state == STATE_WAITING_100_CONTINUE:
@@ -1401,51 +1599,58 @@ class HttpClient:
             if self._state == STATE_COMPLETE:
                 response = self._finalize_response()
                 if response is not None:
-                    return response
+                    self._response = response
+                    return True
                 # None means digest retry, continue processing
 
-        except (HttpConnectionError, HttpTimeoutError, HttpResponseError):
-            self._close()
-            raise
-
-        # Check request timeout for sending/receiving phases
-        if self._request_start_time is not None:
-            timeout = self._request_timeout if self._request_timeout is not None else self._timeout
-            if timeout and _time.time() - self._request_start_time > timeout:
+        except (HttpConnectionError, HttpTimeoutError,
+                HttpResponseError) as err:
+            if (isinstance(err, HttpConnectionError)
+                    and self._can_retry_stale()):
+                retry = True
+            else:
                 self._close()
-                raise HttpTimeoutError("Request timed out")
+                raise
+        else:
+            retry = False
 
-        return None
+        # Outside the handler: the replay itself may raise, and that error
+        # must surface normally instead of escaping from an except block.
+        if retry:
+            self._restart_stale_connection()
+            return False
 
-    def _process_events_eventmode(self, read_sockets, write_sockets):
+        self._check_deadline()
+        return False
+
+    def _handle_eventmode(self, mask):
         self._event = None
         # IDLE: nothing in progress. HEADERS_READY: waiting for accept_body().
         if self._state in (STATE_IDLE, STATE_HEADERS_READY):
-            return None
+            return False
 
         try:
             # Non-blocking connect completion
             if self._state == STATE_CONNECTING:
-                if self._socket in write_sockets:
+                if mask & _selectors.EVENT_WRITE:
                     self._process_connecting()
                 if self._state == STATE_CONNECTING:
                     self._check_connect_timeout()
-                    return None
+                    return False
 
             # Non-blocking SSL handshake
             if self._state == STATE_SSL_HANDSHAKE:
-                if (self._socket in read_sockets
-                        or self._socket in write_sockets):
+                if mask:
                     self._process_ssl_handshake()
                 if self._state == STATE_SSL_HANDSHAKE:
                     self._check_connect_timeout()
-                    return None
+                    return False
 
             # Send request data
-            if self._socket in write_sockets and self._state == STATE_SENDING:
+            if mask & _selectors.EVENT_WRITE and self._state == STATE_SENDING:
                 self._try_send()
 
-            readable = (self._socket in read_sockets
+            readable = (mask & _selectors.EVENT_READ
                         or self._has_ssl_pending()
                         or self._has_pending_body())
             if readable:
@@ -1468,28 +1673,26 @@ class HttpClient:
 
         except (HttpConnectionError, HttpTimeoutError,
                 HttpResponseError) as err:
-            self._error = str(err)
-            self._close()
-            self._event = EVENT_ERROR
-            return self._event
+            if (isinstance(err, HttpConnectionError)
+                    and self._can_retry_stale()):
+                retry = True
+            else:
+                return self._fail_event(str(err))
+        else:
+            retry = False
 
-        # Overall request timeout applies only to pre-body phases; a live
-        # stream may run indefinitely and is bounded by the caller's select
-        # timeout instead.
-        if (self._event is None
-                and self._request_start_time is not None
-                and self._state in (
-                    STATE_SENDING, STATE_RECEIVING_HEADERS,
-                    STATE_WAITING_100_CONTINUE)):
-            timeout = (self._request_timeout
-                       if self._request_timeout is not None
-                       else self._timeout)
-            if timeout and _time.time() - self._request_start_time > timeout:
-                self._error = "Request timed out"
-                self._close()
-                self._event = EVENT_ERROR
+        if retry:
+            try:
+                self._restart_stale_connection()
+            except (HttpConnectionError, HttpTimeoutError,
+                    HttpResponseError) as err:
+                return self._fail_event(str(err))
+            return False
 
-        return self._event
+        if self._event is None:
+            self._deadline_event()
+
+        return self._event is not None
 
     def _process_body_streaming(self):
         """Event-mode body step: recv, decode, emit EVENT_DATA / write file."""
@@ -1537,10 +1740,12 @@ class HttpClient:
         caller; it is cleared on the next request().
         """
         if self._should_keep_alive():
+            self._note_keep_alive()
             self._buffer = bytearray()
             self._body = bytearray()
             self._body_reader = None
             self._state = STATE_IDLE
+            self._idle_since = _time.time()
         else:
             self._close()  # drops the socket, keeps response metadata
 
@@ -1610,6 +1815,7 @@ class HttpClient:
             raise HttpClientError(
                 "accept_body() can only be called after EVENT_HEADERS")
         self._state = STATE_RECEIVING_BODY
+        self._update_interest()
 
     def read_buffer(self):
         """Return decoded body bytes buffered so far, or None if empty."""
@@ -1694,26 +1900,72 @@ class HttpClient:
 
     def _start_request(self):
         """Internal: start sending current request"""
+        self._ensure_selector()
+        self._expire_idle_connection()  # honour Keep-Alive before reusing
+        self._connection_reused = self._socket is not None
         if self._socket is None:
             self._connect()
             # If non-blocking connect in progress, request will be
             # built when connection completes
             if self._state in (STATE_CONNECTING, STATE_SSL_HANDSHAKE):
+                self._update_interest()
                 return
-        self._build_and_start_sending()
+        try:
+            self._build_and_start_sending()
+        except HttpConnectionError:
+            # The synchronous send died on a reused socket the peer had
+            # already dropped; replay it on a fresh connection.
+            if not self._can_retry_stale():
+                self._close()
+                raise
+            self._restart_stale_connection()
+            return
+        self._update_interest()
 
     def wait(self, timeout=None):
-        """Wait for response (blocking).
+        """Wait for a result (blocking), driving this client's own selector.
 
         Classic mode: returns HttpResponse when complete, raises on timeout.
         Event mode: returns the next EVENT_* constant, or None on timeout.
 
         timeout is the max time to spend in this wait() call.
         If None, uses request timeout or client default.
+
+        Requires an owned selector: a blocking wait cannot service the other
+        owners' ready keys of a shared selector, so it would spin on them.
+        Drive a shared selector yourself via handle_event().
         """
+        if not self._owns_selector:
+            raise HttpClientError(
+                "wait() needs the client's own selector; drive a shared one "
+                "with handle_event()")
         if self._event_mode:
             return self._wait_event(timeout)
+        return self._wait_classic(timeout)
 
+    def _select(self, timeout):
+        """Select, or None when the selector/socket is gone.
+
+        None is distinct from an empty list: no events is a timeout, an
+        unusable selector is a connection failure.
+        """
+        try:
+            return self._selector.select(timeout)
+        except (OSError, ValueError) as err:
+            if isinstance(err, ValueError) or err.errno in (
+                    errno.EBADF, errno.EINVAL):
+                return None
+            raise
+
+    def _dispatch(self, events):
+        for key, mask in events:
+            if key.data is not self:
+                continue
+            if self.handle_event(key.fileobj, mask) is not None:
+                return True
+        return False
+
+    def _wait_classic(self, timeout):
         if self._state == STATE_IDLE:
             raise HttpClientError("No request in progress")
 
@@ -1723,35 +1975,28 @@ class HttpClient:
         start_time = _time.time()
 
         while True:
-            # Calculate remaining time for this wait() call
+            if self.next():
+                return self._response
+
             if timeout:
-                elapsed = _time.time() - start_time
-                remaining = timeout - elapsed
+                remaining = timeout - (_time.time() - start_time)
                 if remaining <= 0:
                     self._close()
                     raise HttpTimeoutError("Request timed out")
             else:
                 remaining = None
 
-            # SSL may have buffered data that select() can't see
-            select_timeout = 0 if self._has_ssl_pending() else remaining
-            r, w, x = _select.select(
-                self.read_sockets,
-                self.write_sockets,
-                self.write_sockets, select_timeout
-            )
-            # Windows signals connect errors via except set
-            if x:
-                w = list(set(w) | set(x))
+            # An SSL socket can hold decrypted bytes the selector will never
+            # report, so poll instead of blocking while any are pending.
+            polling = self._has_ssl_pending() or self._has_pending_body()
+            events = self._select(0 if polling else remaining)
+            if events is None:
+                self._close()
+                raise HttpConnectionError("Selector is closed")
+            if self._dispatch(events):
+                return self._response
 
-            # Always call process_events to check request timeout
-            response = self.process_events(r, w)
-
-            if response is not None:
-                return response
-
-            # select() timed out (not SSL pending poll)
-            if not r and not w and select_timeout != 0:
+            if not events and not polling:
                 self._close()
                 raise HttpTimeoutError("Request timed out")
 
@@ -1760,39 +2005,25 @@ class HttpClient:
                 raise HttpResponseError("Request failed")
 
     def _wait_event(self, timeout):
-        """Wait for the next event (event mode).
-
-        Returns an EVENT_* constant, or None when the select() timeout
-        expires with nothing new (the caller loops and calls wait() again).
-        """
-        # IDLE: no request. HEADERS_READY: caller must call accept_body*().
         if self._state in (STATE_IDLE, STATE_HEADERS_READY):
             return None
+
+        if self.next():
+            return self._event
 
         if timeout is None:
             timeout = (self._request_timeout
                        if self._request_timeout is not None
                        else self._timeout)
 
-        # SSL or already-buffered body data is invisible to select() - poll.
-        if self._has_ssl_pending() or self._has_pending_body():
-            select_timeout = 0
-        else:
-            select_timeout = timeout
+        polling = self._has_ssl_pending() or self._has_pending_body()
+        events = self._select(0 if polling else timeout)
+        if events is None:
+            self._fail_event("Selector is closed")
+            return self._event
 
-        try:
-            r, w, x = _select.select(
-                self.read_sockets,
-                self.write_sockets,
-                self.write_sockets, select_timeout)
-        except (OSError, ValueError) as err:
-            self._error = f"select failed: {err}"
-            self._close()
-            self._event = EVENT_ERROR
-            return EVENT_ERROR
-
-        # Windows signals connect errors via the except set
-        if x:
-            w = list(set(w) | set(x))
-
-        return self.process_events(r, w)
+        if self._dispatch(events):
+            return self._event
+        if self.maintenance() is not None:
+            return self._event
+        return None

@@ -3,7 +3,7 @@
 Tests for non-blocking connect (TCP and SSL handshake via select)
 """
 import os
-import select
+import selectors
 import ssl
 import sys
 import threading
@@ -96,29 +96,27 @@ class TestNonBlockingConnect(unittest.TestCase):
         client.wait()
         client.close()
 
-    def test_write_sockets_during_connecting(self):
-        """Test write_sockets returns socket during CONNECTING state"""
+    def test_interest_is_write_during_connecting(self):
+        """Test the selector interest is WRITE during CONNECTING state"""
         client = uhttp_client.HttpClient('127.0.0.1', port=self.PORT)
         client.get('/test')
 
         if client.state == uhttp_client.STATE_CONNECTING:
-            self.assertEqual(len(client.write_sockets), 1)
+            self.assertEqual(client._interest, selectors.EVENT_WRITE)
 
         client.wait()
         client.close()
 
-    def test_process_events_completes_connect(self):
-        """Test that process_events handles connect completion"""
+    def test_handle_event_completes_connect(self):
+        """Test that handle_event handles connect completion"""
         client = uhttp_client.HttpClient('127.0.0.1', port=self.PORT)
         client.get('/test')
 
         response = None
         for _ in range(100):
-            r, w, _ = select.select(
-                client.read_sockets,
-                client.write_sockets,
-                [], 0.1)
-            response = client.process_events(r, w)
+            for key, mask in client.selector.select(0.1):
+                if key.data.handle_event(key.fileobj, mask) is not None:
+                    response = client.response
             if response:
                 break
 
@@ -128,9 +126,12 @@ class TestNonBlockingConnect(unittest.TestCase):
         client.close()
 
     def test_multiple_clients_nonblocking(self):
-        """Test multiple clients connecting non-blocking in one select loop"""
+        """Test multiple clients connecting non-blocking on one selector"""
+        selector = selectors.DefaultSelector()
+        self.addCleanup(selector.close)
         clients = [
-            uhttp_client.HttpClient('127.0.0.1', port=self.PORT)
+            uhttp_client.HttpClient(
+                '127.0.0.1', port=self.PORT, selector=selector)
             for _ in range(3)
         ]
 
@@ -138,26 +139,12 @@ class TestNonBlockingConnect(unittest.TestCase):
             client.get(f'/path{i}')
 
         responses = [None] * len(clients)
-        for _ in range(200):
-            read_socks = []
-            write_socks = []
-            for c in clients:
-                read_socks.extend(c.read_sockets)
-                write_socks.extend(c.write_sockets)
-
-            if not read_socks and not write_socks:
-                break
-
-            r, w, _ = select.select(read_socks, write_socks, [], 0.1)
-
-            for i, client in enumerate(clients):
-                if responses[i] is None:
-                    resp = client.process_events(r, w)
-                    if resp:
-                        responses[i] = resp
-
-            if all(r is not None for r in responses):
-                break
+        deadline = time.time() + 20
+        while None in responses and time.time() < deadline:
+            for key, mask in selector.select(0.1):
+                ready = key.data.handle_event(key.fileobj, mask)
+                if ready is not None:
+                    responses[clients.index(ready)] = ready.response
 
         for i, resp in enumerate(responses):
             self.assertIsNotNone(resp, f"Client {i} got no response")
@@ -216,18 +203,15 @@ class TestNonBlockingConnectRefused(unittest.TestCase):
     @unittest.skipIf(
         sys.platform == 'win32',
         'Windows signals connect errors via except fds in select()')
-    def test_connection_refused_via_process_events(self):
-        """Test connection refused detected via process_events"""
+    def test_connection_refused_via_handle_event(self):
+        """Test connection refused detected via handle_event"""
         client = uhttp_client.HttpClient('127.0.0.1', port=59998)
 
         with self.assertRaises(uhttp_client.HttpConnectionError):
             client.get('/test')
             for _ in range(50):
-                r, w, _ = select.select(
-                    client.read_sockets,
-                    client.write_sockets,
-                    [], 0.1)
-                client.process_events(r, w)
+                for key, mask in client.selector.select(0.1):
+                    key.data.handle_event(key.fileobj, mask)
 
         client.close()
 
@@ -301,11 +285,9 @@ class TestNonBlockingSSLConnect(unittest.TestCase):
 
         response = None
         for _ in range(100):
-            r, w, _ = select.select(
-                client.read_sockets,
-                client.write_sockets,
-                [], 0.1)
-            response = client.process_events(r, w)
+            for key, mask in client.selector.select(0.1):
+                if key.data.handle_event(key.fileobj, mask) is not None:
+                    response = client.response
             if response:
                 break
 
@@ -370,37 +352,26 @@ class TestNonBlockingSSLConnect(unittest.TestCase):
         client.close()
 
     def test_ssl_multiple_clients(self):
-        """Test multiple SSL clients in one select loop"""
+        """Test multiple SSL clients on one shared selector"""
+        selector = selectors.DefaultSelector()
+        self.addCleanup(selector.close)
         clients = []
         for _ in range(3):
             ssl_ctx = _create_client_ssl_context()
             clients.append(uhttp_client.HttpClient(
-                '127.0.0.1', port=self.PORT, ssl_context=ssl_ctx))
+                '127.0.0.1', port=self.PORT, ssl_context=ssl_ctx,
+                selector=selector))
 
         for i, client in enumerate(clients):
             client.get(f'/path{i}')
 
         responses = [None] * len(clients)
-        for _ in range(200):
-            read_socks = []
-            write_socks = []
-            for c in clients:
-                read_socks.extend(c.read_sockets)
-                write_socks.extend(c.write_sockets)
-
-            if not read_socks and not write_socks:
-                break
-
-            r, w, _ = select.select(read_socks, write_socks, [], 0.1)
-
-            for i, client in enumerate(clients):
-                if responses[i] is None:
-                    resp = client.process_events(r, w)
-                    if resp:
-                        responses[i] = resp
-
-            if all(r is not None for r in responses):
-                break
+        deadline = time.time() + 20
+        while None in responses and time.time() < deadline:
+            for key, mask in selector.select(0.1):
+                ready = key.data.handle_event(key.fileobj, mask)
+                if ready is not None:
+                    responses[clients.index(ready)] = ready.response
 
         for i, resp in enumerate(responses):
             self.assertIsNotNone(resp, f"Client {i} got no response")
