@@ -20,6 +20,28 @@ MB = 2 ** 20
 # because some MicroPython ports do not define EWOULDBLOCK.
 EWOULDBLOCK = getattr(errno, 'EWOULDBLOCK', errno.EAGAIN)
 
+
+def _errnos(*names):
+    """Collect the errno values a port actually defines"""
+    values = []
+    for name in names:
+        value = getattr(errno, name, None)
+        if value is not None and value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+# "No progress yet" rather than a failure: the non-blocking family plus
+# ENOENT, which MicroPython raises while an SSL handshake is in flight.
+WOULD_BLOCK_ERRNOS = _errnos(
+    'EAGAIN', 'EWOULDBLOCK', 'EINPROGRESS', 'EALREADY', 'ENOENT')
+
+
+def _would_block(err):
+    """True when an OSError only means the operation has not progressed"""
+    return err.errno in WOULD_BLOCK_ERRNOS
+
+
 CONNECT_TIMEOUT = 10
 TIMEOUT = 30
 
@@ -282,6 +304,17 @@ class _NdjsonDecoder(_RecordDecoder):
         return []
 
 
+def _has_header(headers, name):
+    """HTTP field names are case-insensitive, so 'Host' must hide 'host'"""
+    if name in headers:
+        return True
+    lowered = name.lower()
+    for key in headers:
+        if key.lower() == lowered:
+            return True
+    return False
+
+
 def _parse_header_line(line):
     try:
         line = line.decode('ascii')
@@ -326,14 +359,33 @@ def parse_url(url):
         else:
             auth = (auth_part, '')
 
-    if ':' in host_port:
+    # A bracketed IPv6 literal (RFC 3986 3.2.2) is full of colons, so the
+    # port can only be what follows the closing bracket.
+    port = None
+    if host_port.startswith('['):
+        end = host_port.find(']')
+        if end == -1:
+            raise HttpClientError(f"Unterminated IPv6 address: {host_port}")
+        host = host_port[1:end]
+        rest = host_port[end + 1:]
+        if rest.startswith(':'):
+            port = _parse_port(rest[1:])
+    elif ':' in host_port:
         host, port_str = host_port.rsplit(':', 1)
-        port = int(port_str)
+        port = _parse_port(port_str)
     else:
         host = host_port
+    if port is None:
         port = 443 if ssl else 80
 
     return host, port, path, ssl, auth
+
+
+def _parse_port(value):
+    try:
+        return int(value)
+    except ValueError as err:
+        raise HttpClientError(f"Invalid port: {value}") from err
 
 
 def _encode_query(query):
@@ -356,12 +408,12 @@ def _encode_request_data(data, headers):
         return None
     if isinstance(data, (dict, list, tuple)):
         data = _json.dumps(data).encode('ascii')
-        if CONTENT_TYPE not in headers:
+        if not _has_header(headers, CONTENT_TYPE):
             headers[CONTENT_TYPE] = CONTENT_TYPE_JSON
     elif isinstance(data, str):
         data = data.encode('utf-8')
     elif isinstance(data, (bytes, bytearray, memoryview)):
-        if CONTENT_TYPE not in headers:
+        if not _has_header(headers, CONTENT_TYPE):
             headers[CONTENT_TYPE] = CONTENT_TYPE_OCTET_STREAM
     else:
         raise HttpClientError(f"Unsupported data type: {type(data).__name__}")
@@ -738,16 +790,16 @@ class HttpClient:
 
         full_path = path + _encode_query(query)
 
-        if HOST not in headers:
+        if not _has_header(headers, HOST):
             if self._port == 80 or (self._ssl_context and self._port == 443):
                 headers[HOST] = self._host
             else:
                 headers[HOST] = f"{self._host}:{self._port}"
 
-        if USER_AGENT not in headers:
+        if not _has_header(headers, USER_AGENT):
             headers[USER_AGENT] = USER_AGENT_VALUE
 
-        if encoded_data:
+        if encoded_data and not _has_header(headers, CONTENT_LENGTH):
             headers[CONTENT_LENGTH] = len(encoded_data)
 
         # Add Expect: 100-continue header if requested and there's data to send
@@ -761,7 +813,7 @@ class HttpClient:
 
         # Use request-specific auth if set, otherwise client's default
         auth = self._request_auth if self._request_auth is not None else self._auth
-        if auth and AUTHORIZATION not in headers:
+        if auth and not _has_header(headers, AUTHORIZATION):
             if self._digest_params:
                 # Digest auth
                 self._digest_nc += 1
@@ -813,31 +865,44 @@ class HttpClient:
         try:
             addr_info = _socket.getaddrinfo(
                 self._host, self._port, 0, _socket.SOCK_STREAM)
-            if not addr_info:
-                raise HttpConnectionError(
-                    f"Cannot resolve host: {self._host}")
-            family, socktype, proto, _, addr = addr_info[0]
-            sock = _socket.socket(family, socktype, proto)
-            sock.setblocking(False)
-            try:
-                sock.connect(addr)
-                # Connect completed immediately (e.g. loopback)
-                self._socket = sock
-                self._connect_complete()
-            except OSError as err:
-                if err.errno in (
-                        errno.EINPROGRESS, errno.EAGAIN,
-                        errno.EALREADY, errno.EWOULDBLOCK):
-                    self._socket = sock
-                    self._state = STATE_CONNECTING
-                else:
-                    sock.close()
-                    raise HttpConnectionError(
-                        f"Connect failed: {err}") from err
-        except HttpConnectionError:
-            raise
         except OSError as err:
             raise HttpConnectionError(f"Connect failed: {err}") from err
+        if not addr_info:
+            raise HttpConnectionError(f"Cannot resolve host: {self._host}")
+
+        # getaddrinfo may return both IPv6 and IPv4 records; a dual-stack
+        # host whose AAAA is unreachable must still connect over IPv4.
+        last_error = None
+        for family, socktype, proto, _, addr in addr_info:
+            try:
+                sock, in_progress = self._open_socket(
+                    family, socktype, proto, addr)
+            except OSError as err:
+                last_error = err
+                continue
+            # Adopted: from here a failure belongs to this connection, not
+            # to the candidate list, so it must not try the next address.
+            self._socket = sock
+            if in_progress:
+                self._state = STATE_CONNECTING
+            else:
+                self._connect_complete()
+            return
+        raise HttpConnectionError(f"Connect failed: {last_error}")
+
+    @staticmethod
+    def _open_socket(family, socktype, proto, addr):
+        """Start a non-blocking connect; (socket, still_connecting)"""
+        sock = _socket.socket(family, socktype, proto)
+        try:
+            sock.setblocking(False)
+            sock.connect(addr)
+        except OSError as err:
+            if not _would_block(err):
+                sock.close()
+                raise
+            return sock, True
+        return sock, False  # completed immediately (e.g. loopback)
 
     def _connect_complete(self):
         """TCP connection established, start SSL or proceed to sending"""
@@ -901,7 +966,7 @@ class HttpClient:
             # implicitly during first send/recv
             pass
         except OSError as err:
-            if err.errno in (errno.EAGAIN, EWOULDBLOCK, errno.ENOENT):
+            if _would_block(err):
                 self._ssl_want_read = True  # MicroPython
                 return
             self._close()
@@ -992,14 +1057,39 @@ class HttpClient:
 
         self._body_reader = self._make_body_reader()
 
+    def _is_bodyless_response(self):
+        """RFC 7230 3.3.3: status or method fixes the framing as empty.
+
+        Responses to HEAD, and 1xx/204/304 responses, never carry a body -
+        any Content-Length they advertise describes what a GET would have
+        returned, and waiting for it would hang until the timeout.
+        """
+        status = self._response_status
+        if status is not None and (status < 200 or status in (204, 304)):
+            return True
+        method = self._request_method
+        return method is not None and method.upper() == 'HEAD'
+
+    def _content_length(self):
+        """Parsed Content-Length, or None when absent"""
+        value = self._response_headers.get(CONTENT_LENGTH)
+        if value is None:
+            return None
+        value = value.strip()
+        if not value.isdigit():
+            raise HttpResponseError(f"Invalid Content-Length: {value}")
+        return int(value)
+
     def _make_body_reader(self):
         """Select a body framing strategy based on response headers."""
+        if self._is_bodyless_response():
+            return _LengthBodyReader(0)
         te = self._response_headers.get(TRANSFER_ENCODING, '').lower()
         if CHUNKED in te:
             return _ChunkedBodyReader()
-        cl = self._response_headers.get(CONTENT_LENGTH)
-        if cl is not None:
-            return _LengthBodyReader(int(cl))
+        length = self._content_length()
+        if length is not None:
+            return _LengthBodyReader(length)
         if self._request_stream:
             # Streaming request without framing: read until the server closes
             # the connection (MJPEG, SSE, close-delimited bodies).
@@ -1010,9 +1100,11 @@ class HttpClient:
 
     def _check_response_length(self):
         """Fast-fail when the advertised Content-Length is too large."""
-        cl = self._response_headers.get(CONTENT_LENGTH)
-        if cl is not None and int(cl) > self._max_response_length:
-            raise HttpResponseError(f"Response too large: {cl}")
+        if self._is_bodyless_response():
+            return
+        length = self._content_length()
+        if length is not None and length > self._max_response_length:
+            raise HttpResponseError(f"Response too large: {length}")
 
     def _feed_body(self):
         """Feed buffered raw bytes through the body reader into self._body."""
@@ -1141,9 +1233,7 @@ class HttpClient:
         except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
             return False
         except OSError as err:
-            if err.errno in (errno.EAGAIN, EWOULDBLOCK, errno.ENOENT):
-                # EAGAIN/EWOULDBLOCK: no data yet (non-blocking; the two
-                # differ on Windows). ENOENT: MicroPython SSL would-block.
+            if _would_block(err):
                 return False
             # A close-delimited body (EOF reader) ends when the connection
             # ends. The termination may surface as an empty read OR an error
@@ -1222,8 +1312,8 @@ class HttpClient:
             except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
                 break
             except OSError as err:
-                if err.errno in (errno.EAGAIN, EWOULDBLOCK):
-                    break  # send buffer full (EWOULDBLOCK differs on Windows)
+                if _would_block(err):
+                    break  # send buffer full
                 raise HttpConnectionError(f"Send failed: {err}") from err
 
         if not self._send_buffer:
