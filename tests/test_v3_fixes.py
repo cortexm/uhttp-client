@@ -5,50 +5,25 @@ Each class pins one defect the selectors migration introduced or left open;
 the explanations live in CLAUDE.md ("Selector Event Loop" / "Keep-alive
 lifecycle").
 """
-import os
 import selectors
 import socket
-import ssl
-import threading
 import time
 import unittest
 
+from tests.helpers import (
+    SSL_AVAILABLE, HangingServer, KeepAliveServer, _ListenerThread,
+    client_ssl_context, server_ssl_context)
 from uhttp import client as uhttp_client
 from uhttp.client import EVENT_ERROR
-from tests.helpers import HangingServer, KeepAliveServer
-
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-CERT_FILE = os.path.join(TESTS_DIR, 'test_cert.pem')
-KEY_FILE = os.path.join(TESTS_DIR, 'test_key.pem')
-SSL_AVAILABLE = os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)
 
 
-def _server_ssl_context():
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(CERT_FILE, KEY_FILE)
-    return ctx
-
-
-def _client_ssl_context():
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-class BulkTlsServer:
+class BulkTlsServer(_ListenerThread):
     """TLS server answering with a body large enough to sit in the SSL buffer."""
 
     def __init__(self, body_size=12000):
         self._body = b'x' * body_size
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(('127.0.0.1', 0))
-        self._sock.listen(1)
-        self.port = self._sock.getsockname()[1]
-        self._ctx = _server_ssl_context()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
+        self._ctx = server_ssl_context()
+        super().__init__(backlog=1)
 
     def _serve(self):
         try:
@@ -70,13 +45,7 @@ class BulkTlsServer:
         except OSError:
             pass
         finally:
-            self._sock.close()
-
-    def stop(self):
-        try:
-            self._sock.close()
-        except OSError:
-            pass
+            self.stop()
 
 
 @unittest.skipUnless(SSL_AVAILABLE, "test cert/key not available")
@@ -88,7 +57,7 @@ class TestSslBufferDrain(unittest.TestCase):
         try:
             client = uhttp_client.HttpClient(
                 '127.0.0.1', port=server.port,
-                ssl_context=_client_ssl_context())
+                ssl_context=client_ssl_context())
             started = time.time()
             response = client.get('/bulk').wait(timeout=3)
             self.assertEqual(len(response.data), 12000)
@@ -115,8 +84,8 @@ class TestWaitOnSharedSelector(unittest.TestCase):
             started = time.time()
             with self.assertRaises(uhttp_client.HttpClientError) as ctx:
                 client.wait(timeout=0.5)
-            self.assertNotIsInstance(ctx.exception,
-                                     uhttp_client.HttpTimeoutError)
+            self.assertNotIsInstance(
+                ctx.exception, uhttp_client.HttpTimeoutError)
             self.assertLess(time.time() - started, 0.4)  # no busy spin
             client.close()
         finally:
@@ -212,8 +181,8 @@ class TestSelectorFailuresAreReported(unittest.TestCase):
             client.selector.close()
             with self.assertRaises(uhttp_client.HttpClientError) as ctx:
                 client.wait(timeout=1)
-            self.assertNotIsInstance(ctx.exception,
-                                     uhttp_client.HttpTimeoutError)
+            self.assertNotIsInstance(
+                ctx.exception, uhttp_client.HttpTimeoutError)
             client.close()
         finally:
             server.stop()

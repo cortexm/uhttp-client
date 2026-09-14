@@ -219,6 +219,8 @@ while len(results) < len(clients):
         if ready is not None:
             results[clients.index(ready)] = ready.response
     for client in clients:
+        while client.next():   # drain results buffered from one recv
+            results[clients.index(client)] = client.response
         client.maintenance()
 
 for client in clients:
@@ -306,6 +308,8 @@ while not all(responses):
         if ready is not None:
             responses[clients.index(ready)] = ready.response
     for c in clients:
+        while c.next():   # drain results buffered from one recv
+            responses[clients.index(c)] = c.response
         c.maintenance()
 
 for c in clients:
@@ -574,9 +578,10 @@ invisible to the selector, so drain with `next()` before blocking again.
 Enforce the request deadline and expire an idle kept-alive connection. A
 shared-selector loop only calls `handle_event()` for *ready* keys, so a hung
 peer would otherwise leave the request pending forever — call this once per
-loop iteration (`wait()` does it for you). Classic mode raises
-`HttpTimeoutError`; event mode returns the client with `EVENT_ERROR` in
-`event`, else `None`.
+loop iteration (`wait()` does it for you). It reports rather than raises, in
+both modes: the client is returned with the reason in `error` (event mode also
+sets `event` to `EVENT_ERROR`), else `None`. One hung peer must not abort a
+loop that serves other owners — only `wait()` raises `HttpTimeoutError`.
 
 It also applies the server's `Keep-Alive` hint to an idle connection, though
 the hint is honoured on reuse as well, so a plain `get().wait()` caller does

@@ -92,7 +92,7 @@ class TestBoundedRecv(unittest.TestCase):
             client._process_recv_headers()
             self.assertTrue(sock.recv_sizes)
             self.assertLessEqual(
-                sock.recv_sizes[0], uhttp_client.MAX_RESPONSE_HEADERS_LENGTH)
+                sock.recv_sizes[0], uhttp_client.BODY_CHUNK_SIZE)
         finally:
             client._socket = None
             client.close()

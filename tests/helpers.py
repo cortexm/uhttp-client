@@ -5,9 +5,29 @@ Keeping the raw TCP servers in one place matters: the graceful-close
 sequence below (FIN then linger) is what stops Windows from RST-ing away a
 trailing response fragment, and a per-file copy would silently lose it.
 """
+import os
 import socket
+import ssl
 import threading
 import time
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+CERT_FILE = os.path.join(TESTS_DIR, 'test_cert.pem')
+KEY_FILE = os.path.join(TESTS_DIR, 'test_key.pem')
+SSL_AVAILABLE = os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)
+
+
+def server_ssl_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(CERT_FILE, KEY_FILE)
+    return ctx
+
+
+def client_ssl_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 def graceful_close(conn):
@@ -63,13 +83,14 @@ class RawServer(_ListenerThread):
         self._delay = delay
         self._requests = requests
         self._close = close
+        self.received = b''
         super().__init__(backlog=1)
 
     def _serve(self):
         try:
             conn, _ = self._sock.accept()
             for _ in range(self._requests):
-                conn.recv(4096)
+                self.received += conn.recv(4096)
                 for fragment in self._fragments:
                     conn.sendall(fragment)
                     if self._delay:
@@ -89,16 +110,24 @@ class KeepAliveServer(_ListenerThread):
     """Keep-alive responder; drop_idle() acts as its idle timeout."""
 
     def __init__(self, keep_alive=None, body=b'{"key": "value"}'):
-        headers = [b'HTTP/1.1 200 OK',
-                   b'Content-Type: application/json',
-                   b'Content-Length: %d' % len(body),
-                   b'Connection: keep-alive']
-        if keep_alive:
-            headers.append(b'Keep-Alive: ' + keep_alive.encode('ascii'))
-        self._response = b'\r\n'.join(headers) + b'\r\n\r\n' + body
+        # keep_alive: hint string for every response, or a list with one
+        # entry per response (None = no header on that response).
+        self._body = body
+        self._hints = (keep_alive if isinstance(keep_alive, list)
+                       else [keep_alive])
         self._lock = threading.Lock()
         self._conns = []
         super().__init__()
+
+    def _response(self, index):
+        headers = [b'HTTP/1.1 200 OK',
+                   b'Content-Type: application/json',
+                   b'Content-Length: %d' % len(self._body),
+                   b'Connection: keep-alive']
+        hint = self._hints[min(index, len(self._hints) - 1)]
+        if hint:
+            headers.append(b'Keep-Alive: ' + hint.encode('ascii'))
+        return b'\r\n'.join(headers) + b'\r\n\r\n' + self._body
 
     def _serve(self):
         try:
@@ -112,9 +141,11 @@ class KeepAliveServer(_ListenerThread):
             pass
 
     def _handle(self, conn):
+        index = 0
         try:
             while conn.recv(4096):
-                conn.sendall(self._response)
+                conn.sendall(self._response(index))
+                index += 1
         except OSError:
             pass
 

@@ -10,9 +10,9 @@ import socket
 import time
 import unittest
 
+from tests.helpers import HangingServer, KeepAliveServer, RawServer
 from uhttp import client as uhttp_client
 from uhttp import server as uhttp_server
-from tests.helpers import HangingServer, KeepAliveServer, RawServer
 from uhttp.client import (
     EVENT_HEADERS, EVENT_DATA, EVENT_COMPLETE, EVENT_RESPONSE, EVENT_ERROR)
 
@@ -316,7 +316,9 @@ class TestMaintenance(unittest.TestCase):
             selector.close()
             server.stop()
 
-    def test_raises_timeout_in_classic_mode(self):
+    def test_reports_timeout_in_classic_mode(self):
+        # A shared loop calls maintenance() for every owner: it must report,
+        # never raise, or one hung peer aborts the whole loop.
         server = HangingServer()
         selector = selectors.DefaultSelector()
         try:
@@ -325,8 +327,8 @@ class TestMaintenance(unittest.TestCase):
                 selector=selector, timeout=0.2)
             self.assertTrue(send_request_then_idle(client, selector))
             time.sleep(0.25)
-            with self.assertRaises(uhttp_client.HttpTimeoutError):
-                client.maintenance()
+            self.assertIs(client.maintenance(), client)
+            self.assertIsNotNone(client.error)
             self.assertIsNone(client._socket)
         finally:
             selector.close()
@@ -532,18 +534,17 @@ class TestStaleConnectionRetry(unittest.TestCase):
         finally:
             client.close()
 
-    def test_non_idempotent_method_is_not_retried(self):
-        server = KeepAliveServer()
+    def test_non_idempotent_method_is_not_replayed(self):
+        # A dead idle socket is detected before reuse (see the probe test),
+        # so only the residual race reaches the replay - and a POST must not
+        # be replayed there: the server may already have processed it.
+        client = uhttp_client.HttpClient('127.0.0.1', port=1)
         try:
-            client = uhttp_client.HttpClient('127.0.0.1', port=server.port)
-            client.get('/one').wait()
-            server.drop_idle()
-            # The server may already have processed a POST before closing.
-            with self.assertRaises(uhttp_client.HttpConnectionError):
-                client.post('/two', json={'a': 1}).wait()
-            client.close()
+            client._connection_reused = True
+            client._request_method = 'POST'
+            self.assertFalse(client._can_retry_stale())
         finally:
-            server.stop()
+            client.close()
 
     def test_retry_gives_up_when_the_server_is_gone(self):
         server = KeepAliveServer()
