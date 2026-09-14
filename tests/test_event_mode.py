@@ -6,78 +6,14 @@ accept_body*() body delivery, and EVENT_ERROR surfacing.
 Uses raw TCP servers so we can produce exact framing and timing.
 """
 import os
-import socket
 import tempfile
-import threading
 import time
 import unittest
 
 from uhttp import client as uhttp_client
+from tests.helpers import RawServer
 from uhttp.client import (
     EVENT_RESPONSE, EVENT_HEADERS, EVENT_DATA, EVENT_COMPLETE, EVENT_ERROR)
-
-
-class RawServer:
-    """Single connection, sends response fragments (optionally with delay)."""
-
-    def __init__(self, fragments, delay=0.0, requests=1, close=True):
-        self._fragments = fragments
-        self._delay = delay
-        self._requests = requests
-        self._close = close
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(('127.0.0.1', 0))
-        self._sock.listen(1)
-        self.port = self._sock.getsockname()[1]
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self):
-        try:
-            conn, _ = self._sock.accept()
-            for _ in range(self._requests):
-                conn.recv(4096)
-                for frag in self._fragments:
-                    conn.sendall(frag)
-                    if self._delay:
-                        time.sleep(self._delay)
-            if self._close:
-                self._graceful_close(conn)
-            else:
-                time.sleep(0.5)
-                conn.close()
-        except OSError:
-            pass
-        finally:
-            self._sock.close()
-
-    @staticmethod
-    def _graceful_close(conn):
-        """Close so all sent bytes are delivered before teardown.
-
-        A plain close() can send a RST that discards in-flight data on
-        Windows (losing a trailing record that has no newline). shutdown()
-        sends a FIN after the data, then we linger until the peer closes so
-        the OS flushes everything first.
-        """
-        try:
-            conn.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-        try:
-            conn.settimeout(2.0)
-            while conn.recv(4096):
-                pass
-        except OSError:
-            pass
-        conn.close()
-
-    def stop(self):
-        try:
-            self._sock.close()
-        except OSError:
-            pass
 
 
 def drive(client, on_headers=None, on_data=None, max_time=5.0):

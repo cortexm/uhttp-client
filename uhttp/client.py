@@ -56,7 +56,6 @@ CONTENT_TYPE_JSON = 'application/json'
 CONTENT_TYPE_OCTET_STREAM = 'application/octet-stream'
 CONNECTION = 'connection'
 CONNECTION_CLOSE = 'close'
-CONNECTION_KEEP_ALIVE = 'keep-alive'
 KEEP_ALIVE_HEADER = 'keep-alive'
 KEEP_ALIVE_SAFETY_FACTOR = 0.9  # close before the server's advertised timeout
 COOKIE = 'cookie'
@@ -800,7 +799,7 @@ class HttpClient:
             return (_selectors.EVENT_READ if self._ssl_want_read
                     else _selectors.EVENT_WRITE)
         if self._state == STATE_SENDING:
-            return _selectors.EVENT_WRITE if self._send_buffer else 0
+            return _selectors.EVENT_WRITE
         if self._state in (
                 STATE_WAITING_100_CONTINUE,
                 STATE_RECEIVING_HEADERS, STATE_RECEIVING_BODY):
@@ -996,9 +995,7 @@ class HttpClient:
             if self._connect_timeout and elapsed > self._connect_timeout:
                 self._close()
                 raise HttpTimeoutError("Connect timed out")
-            timeout = (self._request_timeout
-                       if self._request_timeout is not None
-                       else self._timeout)
+            timeout = self._effective_timeout()
             if timeout and elapsed > timeout:
                 self._close()
                 raise HttpTimeoutError("Request timed out")
@@ -1079,21 +1076,8 @@ class HttpClient:
                 self._start_request()
                 return None  # Signal to continue waiting
 
-        response = HttpResponse(
-            self._response_status,
-            self._response_status_message,
-            self._response_headers,
-            bytes(self._body)
-        )
-
-        if not self._should_keep_alive():
-            self._close()
-        else:
-            self._note_keep_alive()
-            self._reset_request()
-            self._state = STATE_IDLE
-            self._idle_since = _time.time()
-
+        response = self._build_response()
+        self._finish_keepalive(reset=True)
         return response
 
     def _parse_set_cookie(self, val):
@@ -1228,8 +1212,12 @@ class HttpClient:
     def _recv_into_body(self):
         """Receive and decode body bytes into self._body."""
         recv_size = self._body_reader.wanted()
+        # MicroPython's recv(n) preallocates n bytes, so never ask for the
+        # whole remaining Content-Length - the body arrives in segments.
         if recv_size is None:
             recv_size = BODY_CHUNK_SIZE
+        else:
+            recv_size = min(recv_size, BODY_CHUNK_SIZE)
         if recv_size > 0 and not self._body_reader.complete:
             self._recv_to_buffer(recv_size)
         self._feed_body()
@@ -1376,7 +1364,7 @@ class HttpClient:
                 if sent is None:  # MicroPython SSL returns None on full buffer
                     break
                 if sent > 0:
-                    self._send_buffer = self._send_buffer[sent:]
+                    del self._send_buffer[:sent]
             except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
                 break
             except OSError as err:
@@ -1433,7 +1421,7 @@ class HttpClient:
         """
         if self._state == STATE_IDLE:
             if mask & _selectors.EVENT_READ:
-                self._drop_idle_connection()
+                self._close()  # readable while idle: the peer closed
             return None
         if self._event_mode:
             ready = self._handle_eventmode(mask)
@@ -1446,9 +1434,6 @@ class HttpClient:
                 raise
             return self if self._fail_event(str(err)) else None
         return self if ready else None
-
-    def _drop_idle_connection(self):
-        self._close()
 
     def next(self):
         """Process a result that is already buffered locally.
@@ -1536,6 +1521,11 @@ class HttpClient:
         if _time.time() - self._idle_since >= limit:
             self._close()
 
+    def _effective_timeout(self):
+        if self._request_timeout is not None:
+            return self._request_timeout
+        return self._timeout
+
     def _check_deadline(self):
         if self._state == STATE_IDLE or self._request_start_time is None:
             return
@@ -1546,9 +1536,7 @@ class HttpClient:
                 STATE_SENDING, STATE_RECEIVING_HEADERS,
                 STATE_WAITING_100_CONTINUE):
             return
-        timeout = (self._request_timeout
-                   if self._request_timeout is not None
-                   else self._timeout)
+        timeout = self._effective_timeout()
         if timeout and _time.time() - self._request_start_time > timeout:
             self._close()
             raise HttpTimeoutError("Request timed out")
@@ -1561,9 +1549,6 @@ class HttpClient:
         return False
 
     def _handle_classic(self, mask):
-        if self._state == STATE_IDLE:
-            return False
-
         try:
             # Handle non-blocking connect completion
             if self._state == STATE_CONNECTING:
@@ -1696,7 +1681,10 @@ class HttpClient:
 
     def _process_body_streaming(self):
         """Event-mode body step: recv, decode, emit EVENT_DATA / write file."""
-        self._recv_into_body()
+        # Deliver what is already decoded before pulling more off the wire,
+        # or the record queue grows without bound past max_response_length.
+        if not (self._accept_mode == 'record' and self._records):
+            self._recv_into_body()
         if self._accept_mode == 'file':
             if self._body:
                 self._flush_body_file()
@@ -1723,31 +1711,38 @@ class HttpClient:
         if self._accept_mode == 'file':
             self._close_body_file()
         if self._accept_mode in (None, 'buffer'):
-            self._response = HttpResponse(
-                self._response_status,
-                self._response_status_message,
-                self._response_headers,
-                bytes(self._body))
+            self._response = self._build_response()
         # EVENT_RESPONSE (body arrived with headers) takes precedence.
         if self._event != EVENT_RESPONSE:
             self._event = EVENT_COMPLETE
         self._finish_keepalive()
 
-    def _finish_keepalive(self):
-        """Keep-alive vs close after a completed response (event mode).
+    def _build_response(self):
+        return HttpResponse(
+            self._response_status,
+            self._response_status_message,
+            self._response_headers,
+            bytes(self._body))
 
-        Response metadata (status/headers/response) is preserved for the
-        caller; it is cleared on the next request().
+    def _finish_keepalive(self, reset=False):
+        """Keep-alive vs close after a completed response.
+
+        Event mode keeps the response metadata for the caller and clears it
+        on the next request(); classic mode resets right away because the
+        HttpResponse has already been built.
         """
-        if self._should_keep_alive():
-            self._note_keep_alive()
+        if not self._should_keep_alive():
+            self._close()  # drops the socket, keeps response metadata
+            return
+        self._note_keep_alive()
+        if reset:
+            self._reset_request()
+        else:
             self._buffer = bytearray()
             self._body = bytearray()
             self._body_reader = None
-            self._state = STATE_IDLE
-            self._idle_since = _time.time()
-        else:
-            self._close()  # drops the socket, keeps response metadata
+        self._state = STATE_IDLE
+        self._idle_since = _time.time()
 
     def _has_pending_body(self):
         """True when buffered body data can progress without a socket read."""
@@ -1970,7 +1965,7 @@ class HttpClient:
             raise HttpClientError("No request in progress")
 
         if timeout is None:
-            timeout = self._request_timeout if self._request_timeout is not None else self._timeout
+            timeout = self._effective_timeout()
 
         start_time = _time.time()
 
@@ -2012,9 +2007,7 @@ class HttpClient:
             return self._event
 
         if timeout is None:
-            timeout = (self._request_timeout
-                       if self._request_timeout is not None
-                       else self._timeout)
+            timeout = self._effective_timeout()
 
         polling = self._has_ssl_pending() or self._has_pending_body()
         events = self._select(0 if polling else timeout)

@@ -6,49 +6,17 @@ These exercise the response body readers (chunked transfer encoding, fixed
 Content-Length, and the no-framing fallback) end-to-end through HttpClient,
 which the uhttp test server cannot easily produce.
 """
-import socket
-import threading
 import unittest
 
 from uhttp import client as uhttp_client
-
-
-class RawResponseServer:
-    """Tiny single-shot TCP server that replies with a fixed raw response."""
-
-    def __init__(self, raw_response):
-        self._raw_response = raw_response
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(('127.0.0.1', 0))
-        self._sock.listen(1)
-        self.port = self._sock.getsockname()[1]
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self):
-        try:
-            conn, _ = self._sock.accept()
-            conn.recv(4096)
-            conn.sendall(self._raw_response)
-            conn.close()
-        except OSError:
-            pass
-        finally:
-            self._sock.close()
-
-    def stop(self):
-        try:
-            self._sock.close()
-        except OSError:
-            pass
+from tests.helpers import RawServer
 
 
 class TestChunkedResponse(unittest.TestCase):
     """End-to-end chunked transfer encoding decoding"""
 
     def _request(self, raw_response):
-        server = RawResponseServer(raw_response)
+        server = RawServer([raw_response])
         try:
             client = uhttp_client.HttpClient('127.0.0.1', port=server.port)
             response = client.get('/').wait()
@@ -105,7 +73,7 @@ class TestFixedLengthResponse(unittest.TestCase):
     """Content-Length framing still works after the reader refactor"""
 
     def _request(self, raw_response):
-        server = RawResponseServer(raw_response)
+        server = RawServer([raw_response])
         try:
             client = uhttp_client.HttpClient('127.0.0.1', port=server.port)
             response = client.get('/').wait()

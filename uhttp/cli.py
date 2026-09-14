@@ -176,12 +176,10 @@ def main():
     # SSL context
     ssl_context = None
     if use_ssl:
+        ssl_context = ssl.create_default_context()
         if args.insecure:
-            ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
-        else:
-            ssl_context = ssl.create_default_context()
 
     # Verbose output
     if args.verbose:
@@ -219,11 +217,6 @@ def main():
 
         elapsed = time.time() - start_time
 
-        if response is None:
-            print("Error: Request timed out", file=sys.stderr)
-            client.close()
-            sys.exit(1)
-
         # Verbose response info
         if args.verbose:
             print(
@@ -248,8 +241,7 @@ def main():
                 print(text)
             except UnicodeDecodeError:
                 print(f"[Binary data: {format_size(len(response.data))}]")
-                if not args.output:
-                    print("Use -o FILE to save binary data", file=sys.stderr)
+                print("Use -o FILE to save binary data", file=sys.stderr)
 
         client.close()
 

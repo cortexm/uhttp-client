@@ -15,6 +15,7 @@ import unittest
 
 from uhttp import client as uhttp_client
 from uhttp.client import EVENT_ERROR
+from tests.helpers import HangingServer, KeepAliveServer
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 CERT_FILE = os.path.join(TESTS_DIR, 'test_cert.pem')
@@ -72,100 +73,6 @@ class BulkTlsServer:
             self._sock.close()
 
     def stop(self):
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-
-
-class KeepAliveServer:
-    """Keep-alive responder that can drop or reset the idle connection."""
-
-    def __init__(self, keep_alive=None):
-        body = b'{"key": "value"}'
-        headers = [b'HTTP/1.1 200 OK',
-                   b'Content-Type: application/json',
-                   b'Content-Length: %d' % len(body),
-                   b'Connection: keep-alive']
-        if keep_alive:
-            headers.append(b'Keep-Alive: ' + keep_alive.encode('ascii'))
-        self._response = b'\r\n'.join(headers) + b'\r\n\r\n' + body
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(('127.0.0.1', 0))
-        self._sock.listen(2)
-        self.port = self._sock.getsockname()[1]
-        self._lock = threading.Lock()
-        self._conns = []
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self):
-        try:
-            while True:
-                conn, _ = self._sock.accept()
-                with self._lock:
-                    self._conns.append(conn)
-                threading.Thread(
-                    target=self._handle, args=(conn,), daemon=True).start()
-        except OSError:
-            pass
-
-    def _handle(self, conn):
-        try:
-            while conn.recv(4096):
-                conn.sendall(self._response)
-        except OSError:
-            pass
-
-    def drop_idle(self):
-        with self._lock:
-            conns, self._conns = self._conns, []
-        for conn in conns:
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                conn.close()
-            except OSError:
-                pass
-
-    def stop(self):
-        self.drop_idle()
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-
-
-class HangingServer:
-    """Accepts and never answers."""
-
-    def __init__(self):
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(('127.0.0.1', 0))
-        self._sock.listen(1)
-        self.port = self._sock.getsockname()[1]
-        self._conns = []
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self):
-        try:
-            while True:
-                conn, _ = self._sock.accept()
-                self._conns.append(conn)
-        except OSError:
-            pass
-
-    def stop(self):
-        for conn in self._conns:
-            try:
-                conn.close()
-            except OSError:
-                pass
         try:
             self._sock.close()
         except OSError:
