@@ -3,7 +3,7 @@ name: MicroPython Integration
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, v2]
 
 jobs:
   unit-tests:
@@ -20,6 +20,11 @@ jobs:
   micropython:
     runs-on: [self-hosted, Linux]
     needs: unit-tests
+    # One device, two maintained branches - queue instead of colliding, and
+    # never cancel: interrupting mpytool mid-operation wedges the REPL.
+    concurrency:
+      group: micropython-${{ matrix.device }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
