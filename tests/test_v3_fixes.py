@@ -187,6 +187,27 @@ class TestSelectorFailuresAreReported(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_closed_select_selector_is_not_reported_as_timeout(self):
+        # DefaultSelector is SelectSelector on Windows, and close() does not
+        # clear its reader/writer sets - select() then keeps polling the live
+        # socket and returns no events instead of raising, so an unusable
+        # selector looked like a plain timeout there. epoll/kqueue raise
+        # because their own fd is gone, which is why POSIX never saw it.
+        server = HangingServer()
+        try:
+            client = uhttp_client.HttpClient('127.0.0.1', port=server.port)
+            client._selector = selectors.SelectSelector()
+            client._owns_selector = True
+            client.get('/')
+            client.selector.close()
+            with self.assertRaises(uhttp_client.HttpClientError) as ctx:
+                client.wait(timeout=1)
+            self.assertNotIsInstance(
+                ctx.exception, uhttp_client.HttpTimeoutError)
+            client.close()
+        finally:
+            server.stop()
+
     def test_arming_failure_raises_in_classic_mode(self):
         server = HangingServer()
         selector = selectors.DefaultSelector()

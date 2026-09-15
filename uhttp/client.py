@@ -1967,7 +1967,17 @@ class HttpClient:
 
         None is distinct from an empty list: no events is a timeout, an
         unusable selector is a connection failure.
+
+        A closed selector does not fail the same way everywhere, so the
+        registration is checked first: epoll/kqueue raise once their own
+        fd is gone, while SelectSelector (the Windows default) keeps its
+        reader/writer sets and quietly returns no events.
         """
+        if self._interest:
+            try:
+                self._selector.get_key(self._socket)
+            except (KeyError, RuntimeError, ValueError, OSError):
+                return None
         try:
             return self._selector.select(timeout)
         except (OSError, ValueError):
