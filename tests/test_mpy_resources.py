@@ -121,8 +121,73 @@ class TestBoundedRecv(unittest.TestCase):
             client.close()
 
 
+class StepSocket:
+    """Accepts a scripted number of bytes per send(), then blocks."""
+
+    def __init__(self, steps):
+        self._steps = list(steps)
+        self.sent = bytearray()
+
+    def send(self, data):
+        if not self._steps:
+            raise OSError(errno.EAGAIN, 'again')
+        chunk = bytes(data[:self._steps.pop(0)])
+        self.sent.extend(chunk)
+        return len(chunk)
+
+
 class TestSendBufferConsumption(unittest.TestCase):
     """A partial send must not reallocate the remaining buffer."""
+
+    def _sending_client(self, payload, steps):
+        client = uhttp_client.HttpClient('127.0.0.1', port=1)
+        client._socket = StepSocket(steps)
+        client._state = uhttp_client.STATE_SENDING
+        client._pending_body = None
+        client._send_buffer = bytearray(payload)
+        client._send_offset = 0
+        return client
+
+    def test_partial_send_leaves_the_remainder_in_place(self):
+        # The consumed prefix is tracked by an offset, so a short send does
+        # not touch the remaining bytes at all.
+        client = self._sending_client(b'0123456789', [3])
+        try:
+            client._try_send()
+            self.assertEqual(client._send_offset, 3)
+            self.assertEqual(len(client._send_buffer), 10)
+        finally:
+            client._socket = None
+            client.close()
+
+    def test_send_resumes_at_the_offset(self):
+        # Every byte must go out exactly once and in order across the
+        # partial sends - an off-by-one in the memoryview slice would
+        # repeat or drop bytes.
+        client = self._sending_client(b'0123456789', [3, 4, 3])
+        try:
+            client._try_send()
+            self.assertEqual(bytes(client._socket.sent), b'0123456789')
+            self.assertEqual(client._send_offset, 0)
+            self.assertEqual(bytes(client._send_buffer), b'')
+        finally:
+            client._socket = None
+            client.close()
+
+    def test_buffer_compacts_once_the_prefix_outgrows_the_remainder(self):
+        # Compacting on every partial send is the O(n^2) this replaces;
+        # compacting only past the halfway point keeps it amortised O(n).
+        client = self._sending_client(b'0123456789', [4])
+        try:
+            client._try_send()
+            self.assertEqual(len(client._send_buffer), 10)  # 4 < 6 left
+            client._socket = StepSocket([2])
+            client._try_send()
+            self.assertEqual(bytes(client._send_buffer), b'6789')
+            self.assertEqual(client._send_offset, 0)
+        finally:
+            client._socket = None
+            client.close()
 
     def test_partial_send_keeps_the_same_buffer_object(self):
         client = uhttp_client.HttpClient('127.0.0.1', port=1)

@@ -639,6 +639,7 @@ class HttpClient:
         self._ssl_want_read = True
         self._buffer = bytearray()
         self._send_buffer = bytearray()
+        self._send_offset = 0
 
         self._request_method = None
         self._request_path = None
@@ -915,6 +916,7 @@ class HttpClient:
         self._state = STATE_IDLE
         self._buffer = bytearray()
         self._send_buffer = bytearray()
+        self._send_offset = 0
         self._body = bytearray()
         self._body_reader = None
         self._keep_alive_timeout = None
@@ -1336,6 +1338,7 @@ class HttpClient:
         self._body_reader = None
         self._buffer = bytearray()
         self._send_buffer = bytearray()
+        self._send_offset = 0
         self._pending_body = None
         self._event = None
         self._error = None
@@ -1357,14 +1360,37 @@ class HttpClient:
             return False
         return True  # HTTP/1.1 defaults to keep-alive
 
+    @property
+    def _send_pending(self):
+        return len(self._send_buffer) - self._send_offset
+
+    def _consume_sent(self, sent):
+        """Drop sent bytes without rebuilding the buffer.
+
+        Compacts only once the consumed prefix outgrows the remainder, so
+        draining a request copies O(size) in total instead of moving the
+        whole remainder on every partial send.
+        """
+        self._send_offset += sent
+        remaining = len(self._send_buffer) - self._send_offset
+        # MicroPython bytearrays support slice assignment but not deletion,
+        # so shrink in place that way - it keeps the object either way.
+        if remaining <= 0:
+            self._send_buffer[:] = b''
+            self._send_offset = 0
+        elif self._send_offset >= remaining:
+            self._send_buffer[:] = self._send_buffer[self._send_offset:]
+            self._send_offset = 0
+
     def _try_send(self):
-        while self._send_buffer and self._state == STATE_SENDING:
+        while self._send_pending and self._state == STATE_SENDING:
             try:
-                sent = self._socket.send(self._send_buffer)
+                sent = self._socket.send(
+                    memoryview(self._send_buffer)[self._send_offset:])
                 if sent is None:  # MicroPython SSL returns None on full buffer
                     break
                 if sent > 0:
-                    self._send_buffer[:] = self._send_buffer[sent:]
+                    self._consume_sent(sent)
             except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
                 break
             except OSError as err:
@@ -1372,7 +1398,7 @@ class HttpClient:
                     break  # send buffer full
                 raise HttpConnectionError(f"Send failed: {err}") from err
 
-        if not self._send_buffer:
+        if not self._send_pending:
             if self._pending_body is not None:
                 # Waiting for 100 Continue before sending body
                 self._state = STATE_WAITING_100_CONTINUE
