@@ -40,7 +40,7 @@ class BulkTlsServer(_ListenerThread):
                 b'Connection: keep-alive\r\n\r\n'
                 + b'%x\r\n' % len(self._body) + self._body
                 + b'\r\n0\r\n\r\n')
-            time.sleep(5.0)
+            self._linger(5.0)
             conn.close()
         except OSError:
             pass

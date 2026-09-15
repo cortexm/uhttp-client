@@ -306,5 +306,36 @@ class TestStreamBackPressure(unittest.TestCase):
             server.stop()
 
 
+
+class TestFixtureShutdown(unittest.TestCase):
+    """stop() must leave nothing blocked in accept().
+
+    Closing a listening socket does not wake a thread blocked in accept()
+    on Linux (it does on macOS), and the freed fd number goes straight to
+    the next socket() call - the zombie thread then accepts a connection
+    meant for a later fixture and answers it from the stopped server.
+    That is how test_retry_gives_up_when_the_server_is_gone got a valid
+    200 from a server it had just stopped, but only on the Linux runner.
+    """
+
+    def test_stop_joins_the_accept_thread(self):
+        for server in (KeepAliveServer(), HangingServer()):
+            server.stop()
+            self.assertFalse(
+                server._thread.is_alive(), type(server).__name__)
+
+    def test_stopped_port_refuses_new_connections(self):
+        server = KeepAliveServer()
+        port = server.port
+        server.stop()
+        sock = socket.socket()
+        sock.settimeout(2.0)
+        try:
+            with self.assertRaises(OSError):
+                sock.connect(('127.0.0.1', port))
+        finally:
+            sock.close()
+
+
 if __name__ == '__main__':
     unittest.main()

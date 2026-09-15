@@ -570,6 +570,13 @@ class TestStaleConnectionRetry(unittest.TestCase):
             server.stop()
 
 
+# The shared-loop test needs the server's v3 selector API. CI installs
+# uhttp-server from PyPI, which is still v2 there, so gate on the marker
+# instead of failing the client's suite on a cross-repo release order.
+SERVER_V3 = hasattr(uhttp_server.HttpServer, 'maintenance')
+
+
+@unittest.skipUnless(SERVER_V3, "uhttp-server v3 (selector API) not installed")
 class TestSharedLoopWithServer(unittest.TestCase):
     """One selector drives an HttpServer and an HttpClient together."""
 

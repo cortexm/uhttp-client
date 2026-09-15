@@ -57,6 +57,7 @@ class _ListenerThread:
     """Binds an ephemeral port and serves accepted connections in a thread."""
 
     def __init__(self, backlog=2):
+        self._stopped = False
         self._sock = socket.socket()
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(('127.0.0.1', 0))
@@ -68,7 +69,36 @@ class _ListenerThread:
     def _serve(self):
         raise NotImplementedError
 
+    def _wake_accept(self):
+        """Unblock accept() so the thread exits before the fd is closed.
+
+        Closing the listener does not wake a thread blocked in accept() on
+        Linux, and the freed fd number is handed straight to the next
+        socket() call - the zombie thread then accepts a connection meant
+        for a later fixture and answers it from the stopped server. A
+        self-connect wakes it on every platform.
+        """
+        try:
+            waker = socket.socket()
+            waker.settimeout(1.0)
+            waker.connect(('127.0.0.1', self.port))
+            waker.close()
+        except OSError:
+            pass
+
+    def _linger(self, seconds):
+        """Hold a served connection open, but let stop() cut it short."""
+        deadline = time.time() + seconds
+        while not self._stopped and time.time() < deadline:
+            time.sleep(0.01)
+
     def stop(self):
+        if self._stopped:
+            return
+        self._stopped = True
+        if self._thread is not threading.current_thread():
+            self._wake_accept()
+            self._thread.join(2.0)
         try:
             self._sock.close()
         except OSError:
@@ -98,7 +128,7 @@ class RawServer(_ListenerThread):
             if self._close:
                 graceful_close(conn)
             else:
-                time.sleep(0.5)
+                self._linger(0.5)
                 conn.close()
         except OSError:
             pass
@@ -131,8 +161,11 @@ class KeepAliveServer(_ListenerThread):
 
     def _serve(self):
         try:
-            while True:
+            while not self._stopped:
                 conn, _ = self._sock.accept()
+                if self._stopped:
+                    conn.close()
+                    break
                 with self._lock:
                     self._conns.append(conn)
                 threading.Thread(
@@ -164,8 +197,10 @@ class KeepAliveServer(_ListenerThread):
                 pass
 
     def stop(self):
-        self.drop_idle()
+        # Stop the listener first: super().stop() joins the accept thread,
+        # so nothing can register a late connection behind drop_idle().
         super().stop()
+        self.drop_idle()
 
 
 class HangingServer(_ListenerThread):
@@ -177,16 +212,19 @@ class HangingServer(_ListenerThread):
 
     def _serve(self):
         try:
-            while True:
+            while not self._stopped:
                 conn, _ = self._sock.accept()
+                if self._stopped:
+                    conn.close()
+                    break
                 self._conns.append(conn)
         except OSError:
             pass
 
     def stop(self):
+        super().stop()
         for conn in self._conns:
             try:
                 conn.close()
             except OSError:
                 pass
-        super().stop()
