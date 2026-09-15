@@ -150,7 +150,7 @@ class _LengthBodyReader(_BodyReader):
         if take == 0:
             return b''
         data = bytes(buffer[:take])
-        del buffer[:take]
+        buffer[:] = buffer[take:]
         self._remaining -= take
         if self._remaining <= 0:
             self.complete = True
@@ -182,7 +182,7 @@ class _ChunkedBodyReader(_BodyReader):
                 if idx == -1:
                     break
                 line = bytes(buffer[:idx]).strip()
-                del buffer[:idx + 1]
+                buffer[:] = buffer[idx + 1:]
                 if b';' in line:
                     line = line[:line.index(b';')].strip()
                 if not line:
@@ -202,7 +202,7 @@ class _ChunkedBodyReader(_BodyReader):
                     break
                 take = min(self._remaining, len(buffer))
                 out.extend(buffer[:take])
-                del buffer[:take]
+                buffer[:] = buffer[take:]
                 self._remaining -= take
                 if self._remaining == 0:
                     self._sub = self._CRLF
@@ -212,16 +212,16 @@ class _ChunkedBodyReader(_BodyReader):
                 if buffer[:1] == b'\r':
                     if len(buffer) < 2:
                         break
-                    del buffer[:2]
+                    buffer[:] = buffer[2:]
                 elif buffer[:1] == b'\n':
-                    del buffer[:1]
+                    buffer[:] = buffer[1:]
                 self._sub = self._SIZE
             elif self._sub == self._TRAILER:
                 idx = buffer.find(b'\n')
                 if idx == -1:
                     break
                 line = bytes(buffer[:idx]).strip()
-                del buffer[:idx + 1]
+                buffer[:] = buffer[idx + 1:]
                 if not line:
                     self.complete = True
                     break
@@ -241,7 +241,7 @@ class _EofBodyReader(_BodyReader):
         if not buffer:
             return b''
         data = bytes(buffer)
-        del buffer[:]
+        buffer[:] = b''
         return data
 
     def feed_eof(self):
@@ -285,7 +285,7 @@ class _NdjsonDecoder(_RecordDecoder):
         idx = self._carry.find(b'\n')
         while idx != -1:
             line = bytes(self._carry[:idx]).strip()
-            del self._carry[:idx + 1]
+            self._carry[:] = self._carry[idx + 1:]
             if line:
                 try:
                     records.append(_decode_json(line))
@@ -1364,7 +1364,7 @@ class HttpClient:
                 if sent is None:  # MicroPython SSL returns None on full buffer
                     break
                 if sent > 0:
-                    del self._send_buffer[:sent]
+                    self._send_buffer[:] = self._send_buffer[sent:]
             except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError):
                 break
             except OSError as err:

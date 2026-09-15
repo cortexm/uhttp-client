@@ -6,6 +6,7 @@ errno names, so both the would-block handling and every recv/send size
 have to stay bounded and defensive.
 """
 import errno
+import re
 import unittest
 
 from uhttp import client as uhttp_client
@@ -62,6 +63,28 @@ class TestWouldBlock(unittest.TestCase):
             self.assertFalse(
                 uhttp_client._would_block(OSError(value, name)),
                 f"{name} must not count as would-block")
+
+
+class TestSliceDeletion(unittest.TestCase):
+    """bytearray slice deletion is CPython-only.
+
+    MicroPython implements slice assignment but not deletion, so
+    `del buf[:n]` raises TypeError there while `buf[:] = buf[n:]` shrinks
+    in place and keeps the object on both. No behavioural test can catch
+    this - the construct is perfectly legal here - and the failure mode
+    hides itself on-device: in the send path the bytes are already on the
+    wire when the exception fires, so the peer sees a valid request and
+    only the next operation reveals that the loop died.
+    """
+
+    def test_no_bytearray_slice_deletion(self):
+        with open(uhttp_client.__file__) as handle:
+            source = handle.read()
+        offenders = [
+            line.strip() for line in source.splitlines()
+            if re.search(r'\bdel\s+[\w.]+\[[^\]]*:', line)]
+        self.assertEqual(
+            offenders, [], "slice deletion is not supported on MicroPython")
 
 
 class TestBoundedRecv(unittest.TestCase):
