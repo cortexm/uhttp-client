@@ -1780,11 +1780,19 @@ class HttpClient:
         else:
             select_timeout = timeout
 
+        read_socks = self.read_sockets
+        write_socks = self.write_sockets
+        if not read_socks and not write_socks:
+            # Nothing left to watch: at STATE_COMPLETE the socket is out of
+            # both lists while decoded records may still be queued. Deliver
+            # them - waiting on nothing cannot help, and Windows' select()
+            # rejects all-empty sets outright (WinError 10022), which turned
+            # a queued record into EVENT_ERROR.
+            return self.process_events([], [])
+
         try:
             r, w, x = _select.select(
-                self.read_sockets,
-                self.write_sockets,
-                self.write_sockets, select_timeout)
+                read_socks, write_socks, write_socks, select_timeout)
         except (OSError, ValueError) as err:
             self._error = f"select failed: {err}"
             self._close()

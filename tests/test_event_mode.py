@@ -5,6 +5,7 @@ accept_body*() body delivery, and EVENT_ERROR surfacing.
 
 Uses raw TCP servers so we can produce exact framing and timing.
 """
+import errno
 import os
 import socket
 import tempfile
@@ -308,6 +309,55 @@ class TestEventModeNdjson(unittest.TestCase):
             self.assertEqual(records, [{'ok': 1}])  # good record delivered first
             client.close()
         finally:
+            server.stop()
+
+
+class _WindowsSelect:
+    """select() that rejects all-empty fd sets, the way Windows does.
+
+    POSIX happily waits on nothing; Windows needs at least one non-empty
+    set and answers WSAEINVAL (WinError 10022) otherwise. The client
+    reaches that call at STATE_COMPLETE, where read_sockets and
+    write_sockets are both empty but decoded records may still be queued.
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def __call__(self, readers, writers, errors, timeout=None):
+        if not readers and not writers and not errors:
+            raise OSError(errno.EINVAL, 'An invalid argument was supplied')
+        return self._real(readers, writers, errors, timeout)
+
+
+class TestNothingToSelectOn(unittest.TestCase):
+    """Buffered output must survive having no socket left to watch."""
+
+    def test_trailing_record_survives_windows_empty_select(self):
+        # One recv carries the body and the EOF, so both records are decoded
+        # at once and the second is still queued after the first EVENT_DATA.
+        # By then the socket is out of read_sockets/write_sockets.
+        server = RawServer([
+            b'HTTP/1.1 200 OK\r\n'
+            b'Content-Type: application/x-ndjson\r\n'
+            b'Connection: close\r\n\r\n'
+            b'{"x": 1}\n{"y": 2}'], delay=0.0, close=True)
+        real_select = uhttp_client._select.select
+        uhttp_client._select.select = _WindowsSelect(real_select)
+        records = []
+        try:
+            client = uhttp_client.HttpClient(
+                '127.0.0.1', port=server.port, event_mode=True)
+            client.get('/', stream=True)
+            events = drive(
+                client,
+                on_headers=lambda c: c.accept_ndjson(),
+                on_data=lambda c: records.append(c.read_record()))
+            self.assertNotIn(EVENT_ERROR, events, client.error)
+            self.assertEqual(records, [{'x': 1}, {'y': 2}])
+            client.close()
+        finally:
+            uhttp_client._select.select = real_select
             server.stop()
 
 

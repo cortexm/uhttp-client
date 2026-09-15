@@ -93,6 +93,15 @@ class TestBodylessResponses(unittest.TestCase):
         self.assertEqual(response.data, b'')
 
 
+# An address family no port implements, so socket() raises before any
+# connect: family -1 does NOT do that - CPython's socket.__init__ maps -1
+# to AF_INET, and the candidate then failed only because connect() to an
+# IPv6 literal happens to raise at once on POSIX. On Windows it does not,
+# so the client adopted the socket and sat in STATE_CONNECTING until the
+# test's own timeout.
+BAD_FAMILY = 12345
+
+
 class TestAddressFallback(unittest.TestCase):
     """(10) getaddrinfo returns several addresses; all must be tried."""
 
@@ -105,7 +114,9 @@ class TestAddressFallback(unittest.TestCase):
         def two_addresses(host, port, *args, **kwargs):
             real = original('127.0.0.1', port, *args, **kwargs)
             # A family socket() rejects outright, then the working address.
-            return [(-1, socket.SOCK_STREAM, 0, '', ('::1', port))] + list(real)
+            return [
+                (BAD_FAMILY, socket.SOCK_STREAM, 0, '', ('::1', port)),
+            ] + list(real)
 
         uhttp_client._socket.getaddrinfo = two_addresses
         try:
@@ -121,8 +132,10 @@ class TestAddressFallback(unittest.TestCase):
         original = uhttp_client._socket.getaddrinfo
 
         def only_bad(host, port, *args, **kwargs):
-            return [(-1, socket.SOCK_STREAM, 0, '', ('::1', port)),
-                    (-1, socket.SOCK_STREAM, 0, '', ('127.0.0.1', port))]
+            return [
+                (BAD_FAMILY, socket.SOCK_STREAM, 0, '', ('::1', port)),
+                (BAD_FAMILY, socket.SOCK_STREAM, 0, '', ('127.0.0.1', port)),
+            ]
 
         uhttp_client._socket.getaddrinfo = only_bad
         try:
